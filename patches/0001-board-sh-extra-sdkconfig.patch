@@ -1,0 +1,15 @@
+diff --git a/esp32/tools/muse/board.sh b/esp32/tools/muse/board.sh
+index c00a5a8..2e8aa36 100755
+--- a/esp32/tools/muse/board.sh
++++ b/esp32/tools/muse/board.sh
+@@ -105,6 +105,10 @@ if [ -n "${MUSE_BENCH:-}" ]; then
+     B=$B-bench; defaults="$defaults;devices/sdkconfig.muse-bench"
+ fi
+ [ -n "${iris:-}" ] && defaults="$defaults;devices/sdkconfig.muse-$profile-iris"
++# stackchan-muse: extra defaults, in a build directory of their own so a stale sdkconfig cannot hide them
++if [ -f devices/sdkconfig.stackchan ]; then
++    B=$B-stackchan; defaults="$defaults;devices/sdkconfig.stackchan"
++fi
+ log=/tmp/muse_build_$board.log
+ # ESP-Mosaico: its Vibe Mode firmware installs an ESP-Iris System Update
+ # bundle (the app and this partition table; never the bootloader or the
