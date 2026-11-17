@@ -1,0 +1,1 @@
+# CoreS3 (Stack-chan) 向けの追加設定。devices/sdkconfig.muse と muse-m5stack-cores3 の後に重ねる。
