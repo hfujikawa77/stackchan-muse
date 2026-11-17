@@ -17,6 +17,10 @@ rm -rf "$ESP/components/stackchan_hw"
 cp -r "$HERE/components/stackchan_hw" "$ESP/components/stackchan_hw"
 echo "components: stackchan_hw copied"
 
+# 追加 sdkconfig（patches/0001 で board.sh が読み込む）
+cp "$HERE/sdkconfig.stackchan" "$ESP/devices/sdkconfig.stackchan"
+echo "sdkconfig: copied"
+
 # パッチ（適用済みならスキップ）
 shopt -s nullglob
 for p in "$HERE"/patches/*.patch; do

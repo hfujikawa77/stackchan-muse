@@ -1,1 +1,7 @@
 # CoreS3 (Stack-chan) 向けの追加設定。devices/sdkconfig.muse と muse-m5stack-cores3 の後に重ねる。
+# apply.sh が devices/sdkconfig.stackchan として SDK に置き、patches/0001 で board.sh が読み込む。
+
+# ライブ音声通話（タップで開始/終了、長押しは従来どおり音声メモ）。Muse が声で返事する。
+CONFIG_MUSE_REALTIME_VOICE=y
+# 通話開始時に Muse が挨拶する（動作確認用。うるさければ n）
+CONFIG_MUSE_REALTIME_VOICE_GREETING=y
