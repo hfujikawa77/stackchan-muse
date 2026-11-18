@@ -14,7 +14,7 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 ## 前提
 - ESP-IDF **v6.0.3**（WSL2 Ubuntu に導入）
 - SDK トークン（gadgets.muse.ai）と利用規約への同意
-- `muse-gadget-sdk` を隣のディレクトリに clone 済み（`SDK_DIR` で変更可）
+- `muse-gadget-sdk` を clone 済み（既定は隣のディレクトリ。`SDK_DIR` で変更可。WSL では `~/muse-gadget-sdk` を推奨）
 
 ## 使い方（WSL2 + Windows）
 ビルドは WSL2、書き込みは Windows の COM ポートから行う（usbipd・管理者権限は不要）。
@@ -26,9 +26,9 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 
 ### ビルド + 書き込み（1コマンド）
 ```powershell
-.	oolslash.ps1                # WSL でビルド → build-out/ にコピー → COM7 へ書き込み
-.	oolslash.ps1 -NoBuild       # 前回のビルドをそのまま書き込む
-.	oolslash.ps1 -Port COM5     # ポート指定
+.\tools\flash.ps1                # WSL でビルド → build-out/ にコピー → COM7 へ書き込み
+.\tools\flash.ps1 -NoBuild       # 前回のビルドをそのまま書き込む
+.\tools\flash.ps1 -Port COM5     # ポート指定
 ```
 - WSL 内で `git pull` してからビルドするので、Windows 側の変更は先にコミットしておく
 - シリアルモニタを開いたままだと書き込みに失敗する。先に閉じる
@@ -46,8 +46,7 @@ SDK_DIR=~/muse-gadget-sdk ~/stackchan-muse/tools/build.sh build
 ## SDK トークンの設定（初回）
 トークンは gadgets.muse.ai で取得する。**チャットやリポジトリに貼らない。** デバイスのシリアルコンソールへ、LF 付き1行で送る（端末の Enter は CR のみで効かないことがある）:
 ```powershell
-python -c "import serial,getpass,time; t=getpass.getpass('token: '); s=serial.Serial('COM7',115200); s.write(('>sdk_token='+t+'
-').encode()); time.sleep(2); print(s.read(1500).decode(errors='replace'))"
+python -c "import serial,getpass,time; t=getpass.getpass('token: '); s=serial.Serial('COM7',115200); s.write(('>sdk_token='+t+'\n').encode()); time.sleep(2); print(s.read(1500).decode(errors='replace'))"
 ```
 `@sdk_token ok` で再起動する。そのあと Muse アプリ（設定 → デバイス → Developer mode）で `MuseGadget-XXXXXX` をペアリング。
 
