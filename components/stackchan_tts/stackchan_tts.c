@@ -240,28 +240,38 @@ static void run_request(char *text, uint32_t gen) {
     snprintf(url, sizeof url, "https://texttospeech.googleapis.com/v1/text:synthesize?key=%s", key);
     resp_t r = {0};
     esp_http_client_config_t cfg = {
-        .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 15000,
+        .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 8000,
         .crt_bundle_attach = esp_crt_bundle_attach, .event_handler = on_http, .user_data = &r,
         .buffer_size = 2048, .keep_alive_enable = true,
     };
-    esp_http_client_handle_t h = esp_http_client_init(&cfg);
-    if (h) {
-        esp_http_client_set_header(h, "Content-Type", "application/json");
-        size_t off = 0;
-        bool first = true;
-        while (off < total && s_gen == gen) {
-            while (clean[off] == ' ' || clean[off] == '\n') off++;
-            if (off >= total) break;
-            size_t n = next_chunk(clean + off, first ? FIRST_CHUNK_BYTES : CHUNK_BYTES);
-            if (!n) break;
-            first = false;
-            int rc = speak_chunk(h, &r, voice, lang, clean + off, n, gen);
-            if (rc < 0) break;
-            if (rc == 0 && !s_got) break;   // nothing worked: give up, caller falls back to text
-            off += n;
+    esp_http_client_handle_t h = NULL;
+    size_t off = 0;
+    bool first = true;
+    int fails = 0;
+    while (off < total && s_gen == gen && fails < 3) {
+        while (clean[off] == ' ' || clean[off] == '\n') off++;
+        if (off >= total) break;
+        size_t n = next_chunk(clean + off, first ? FIRST_CHUNK_BYTES : CHUNK_BYTES);
+        if (!n) break;
+        if (!h) {
+            h = esp_http_client_init(&cfg);
+            if (!h) break;
+            esp_http_client_set_header(h, "Content-Type", "application/json");
         }
-        esp_http_client_cleanup(h);
+        int rc = speak_chunk(h, &r, voice, lang, clean + off, n, gen);
+        if (rc < 0) break;
+        if (rc == 0) {
+            // A fresh connection for the retry; the old one may be dead.
+            fails++;
+            ESP_LOGW(TAG, "retrying chunk (%d/3)", fails);
+            esp_http_client_cleanup(h);
+            h = NULL;
+            continue;
+        }
+        first = false;
+        off += n;
     }
+    if (h) esp_http_client_cleanup(h);
     free(r.buf);
     free(clean);
     ESP_LOGI(TAG, "request %u done (audio=%d)", (unsigned)gen, (int)s_got);
