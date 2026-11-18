@@ -33,7 +33,7 @@ edit("main/sdk_token_console.c", lambda s: sub1(
 def chat(s):
     s = sub1(s, '#include "muse_settings.h"\n', '#include "muse_settings.h"\n#include "stackchan_tts.h"\n')
     s = sub1(s, "    bool mp3_ended;\n    mp3dec_t dec;",
-             "    bool mp3_ended;\n    bool sc_tts;             /* MP3 is arriving from stackchan_tts */\n    mp3dec_t dec;")
+             "    bool mp3_ended;\n    bool sc_tts;             /* MP3 is arriving from stackchan_tts */\n    int64_t sc_t0;           /* when that request started */\n    mp3dec_t dec;")
     # start_tts: try Google TTS first
     s = sub1(s, "        m.pcm_start = s_turn.pcm_out;\n        /* Paced to the text kept:",
 """        s_turn.sc_tts = false;

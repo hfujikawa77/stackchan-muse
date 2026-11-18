@@ -12,7 +12,7 @@ index 5c89865..d9e6796 100644
  if(IDF_TARGET STREQUAL "esp32p4")
      list(APPEND muse_priv_requires esp_driver_jpeg)
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 256b5b2..1b0e26e 100644
+index 256b5b2..612e840 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -74,6 +74,7 @@ extern "C" {
@@ -23,15 +23,16 @@ index 256b5b2..1b0e26e 100644
  #include "muse_wifi.h"
  }
  #include "muse_chat_priv.h"
-@@ -269,6 +270,7 @@ struct turn_t {
+@@ -269,6 +270,8 @@ struct turn_t {
      uint8_t *mp3;            /* MP3_BUF */
      size_t mp3_len;
      bool mp3_ended;
 +    bool sc_tts;             /* MP3 is arriving from stackchan_tts */
++    int64_t sc_t0;           /* when that request started */
      mp3dec_t dec;
      resampler_t down;
      int kbps;
-@@ -1608,6 +1610,24 @@ static void start_tts(void)
+@@ -1608,6 +1611,24 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -56,7 +57,7 @@ index 256b5b2..1b0e26e 100644
          m.pcm_start = s_turn.pcm_out;
          /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
           * was kept at reading pace, not stretched over the whole reply's time
-@@ -1673,6 +1693,37 @@ static void decode(void)
+@@ -1673,6 +1694,37 @@ static void decode(void)
      if (s_turn.tts_msg < 0) {
          return;
      }
