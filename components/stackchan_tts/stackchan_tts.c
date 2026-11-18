@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
@@ -192,7 +193,9 @@ static int speak_chunk(esp_http_client_handle_t h, resp_t *r, const char *voice,
     r->over = false;
     if (r->buf) r->buf[0] = 0;
     esp_http_client_set_post_field(h, body, (int)strlen(body));
+    int64_t t0 = esp_timer_get_time();
     esp_err_t err = esp_http_client_perform(h);
+    ESP_LOGI(TAG, "chunk %u bytes: %d ms", (unsigned)n, (int)((esp_timer_get_time() - t0) / 1000));
     int status = esp_http_client_get_status_code(h);
     free(body);
     if (s_gen != gen) return -1;

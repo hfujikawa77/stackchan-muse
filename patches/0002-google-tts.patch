@@ -12,7 +12,7 @@ index 5c89865..d9e6796 100644
  if(IDF_TARGET STREQUAL "esp32p4")
      list(APPEND muse_priv_requires esp_driver_jpeg)
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 256b5b2..43f5616 100644
+index 256b5b2..1b0e26e 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -74,6 +74,7 @@ extern "C" {
@@ -31,7 +31,7 @@ index 256b5b2..43f5616 100644
      mp3dec_t dec;
      resampler_t down;
      int kbps;
-@@ -1608,6 +1610,23 @@ static void start_tts(void)
+@@ -1608,6 +1610,24 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -48,6 +48,7 @@ index 256b5b2..43f5616 100644
 +            s_turn.down_rate = 0;
 +            mp3dec_init(&s_turn.dec);
 +            s_turn.sc_tts = true;
++            s_turn.sc_t0 = now_us();
 +            ESP_LOGI(TAG, "speaking message %s via Google TTS (%u chars)", m.id, (unsigned)m.len);
 +            show_reply_start(m);
 +            return;
@@ -55,7 +56,7 @@ index 256b5b2..43f5616 100644
          m.pcm_start = s_turn.pcm_out;
          /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
           * was kept at reading pace, not stretched over the whole reply's time
-@@ -1673,6 +1692,33 @@ static void decode(void)
+@@ -1673,6 +1693,37 @@ static void decode(void)
      if (s_turn.tts_msg < 0) {
          return;
      }
@@ -69,6 +70,10 @@ index 256b5b2..43f5616 100644
 +            }
 +            mark(M_MP3);
 +            s_turn.mp3_len += n;
++        }
++        if (!ended && !s_turn.mp3_len && !s_turn.down_rate && now_us() - s_turn.sc_t0 > 12000000) {
++            ended = true;   /* no audio in 12 s: give up rather than leave the turn thinking */
++            failed = true;
 +        }
 +        if (ended) {
 +            s_turn.sc_tts = false;

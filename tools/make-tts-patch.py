@@ -49,6 +49,7 @@ def chat(s):
             s_turn.down_rate = 0;
             mp3dec_init(&s_turn.dec);
             s_turn.sc_tts = true;
+            s_turn.sc_t0 = now_us();
             ESP_LOGI(TAG, "speaking message %s via Google TTS (%u chars)", m.id, (unsigned)m.len);
             show_reply_start(m);
             return;
@@ -67,6 +68,10 @@ def chat(s):
             }
             mark(M_MP3);
             s_turn.mp3_len += n;
+        }
+        if (!ended && !s_turn.mp3_len && !s_turn.down_rate && now_us() - s_turn.sc_t0 > 12000000) {
+            ended = true;   /* no audio in 12 s: give up rather than leave the turn thinking */
+            failed = true;
         }
         if (ended) {
             s_turn.sc_tts = false;
