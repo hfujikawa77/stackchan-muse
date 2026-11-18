@@ -51,11 +51,19 @@ python -c "import serial,getpass,time; t=getpass.getpass('token: '); s=serial.Se
 `@sdk_token ok` で再起動する。そのあと Muse アプリ（設定 → デバイス → Developer mode）で `MuseGadget-XXXXXX` をペアリング。
 
 ## 使い方（Stack-chan）
-- 返事の音声: `sdkconfig.stackchan` で `CONFIG_MUSE_REALTIME_VOICE=y`（ライブ音声通話）を有効化済み
-  - PWR を**短くタップ**: 通話の開始/終了（Muse が声で返事する）
-  - PWR を**長押し**: 音声メモ（返事は画面のテキストのみ。Muse はガジェットへの返事を読み上げない）
+- 返事の音声: Google Cloud Text-to-Speech で読み上げる（`components/stackchan_tts` + `patches/0002`）
+  - PWR を**長押し**して話しかける → 返事の文章を Google TTS で MP3 にして再生
+  - 失敗・12 秒超過のときは、従来どおり画面のテキストのみ
+- `sdkconfig.stackchan` で `CONFIG_MUSE_REALTIME_VOICE=y`（ライブ音声通話、実験的）も有効化済み。PWR の短いタップで開始するが、動作は未確認
+
+## Google TTS の設定
+Cloud Text-to-Speech API を有効にした API キーを、シリアルから NVS に保存する（キーはリポジトリ・ビルドに入らない。チャットにも貼らない）:
+```powershell
+python -c "import serial,getpass,time; k=getpass.getpass('tts key: '); s=serial.Serial('COM7',115200); s.write(('>tts_key='+k+'\n').encode()); time.sleep(2); print(s.read(1500).decode(errors='replace'))"
+```
+`@tts_key ok` で保存済み（再起動不要）。声は `>tts_voice=ja-JP-Neural2-C` のように変更できる（既定 `ja-JP-Neural2-B`）。キーの消去は `>tts_key=`。
 - 元の HermesLLM に戻すときは、PlatformIO で `stackchan-arduino/examples/HermesLLM` を書き込む
 
 ## ライセンス
-自作部分は Apache-2.0 を想定。m5stack-avatar (MIT) を参考/流用する場合は、ヘッダーとライセンス表記を残す。
+自作部分は Apache-2.0（`LICENSE`）。`patches/` は上流 muse-gadget-sdk（Apache-2.0）への差分で、上流の著作権表示はそのまま残る。m5stack-avatar (MIT) を参考/流用する場合は、ヘッダーとライセンス表記を残す。
 Jollybot（SDK 同梱アバター）は Apache の対象外なので触らない。

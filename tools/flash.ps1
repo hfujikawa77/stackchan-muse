@@ -8,6 +8,7 @@
 param(
     [string]$Port = 'COM7',
     [string]$Distro = 'Ubuntu-22.04',
+    [string]$WslUser = '',   # default: the WSL distro's default user
     [switch]$NoBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -25,7 +26,8 @@ if (-not $NoBuild) {
 }
 
 Write-Host '== copy binaries =='
-$src = "\\wsl.localhost\$Distro\home\ardupilot\muse-gadget-sdk\esp32\build-muse-m5stack-cores3-stackchan"
+if (-not $WslUser) { $WslUser = (wsl.exe -d $Distro -e whoami).Trim() }
+$src = "\\wsl.localhost\$Distro\home\$WslUser\muse-gadget-sdk\esp32\build-muse-m5stack-cores3-stackchan"
 if (-not (Test-Path "$src\muse-gadget.bin")) { throw "no build output at $src (run without -NoBuild)" }
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item "$src\bootloader\bootloader.bin", "$src\partition_table\partition-table.bin", `
