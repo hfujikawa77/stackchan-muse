@@ -1,0 +1,124 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index 5c89865..d9e6796 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -200,7 +200,7 @@ set(muse_priv_requires
+     # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
+     # before Kconfig values exist, so these can't depend on it; only the code does.
+     fatfs esp_driver_sdspi sdmmc)
+-list(APPEND muse_priv_requires camera)
++list(APPEND muse_priv_requires camera stackchan_tts)
+ # The P4 camera's JPEG encoder; Kconfig is not loaded yet when requirements expand.
+ if(IDF_TARGET STREQUAL "esp32p4")
+     list(APPEND muse_priv_requires esp_driver_jpeg)
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 256b5b2..43f5616 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -74,6 +74,7 @@ extern "C" {
+ #include "muse_account_api.h"
+ #include "muse_link.h"
+ #include "muse_settings.h"
++#include "stackchan_tts.h"
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
+@@ -269,6 +270,7 @@ struct turn_t {
+     uint8_t *mp3;            /* MP3_BUF */
+     size_t mp3_len;
+     bool mp3_ended;
++    bool sc_tts;             /* MP3 is arriving from stackchan_tts */
+     mp3dec_t dec;
+     resampler_t down;
+     int kbps;
+@@ -1608,6 +1610,23 @@ static void start_tts(void)
+          * end. decode() plays it at the speaker's volume, captions following,
+          * and finishes the message once it's drained.
+          */
++        s_turn.sc_tts = false;
++        if (s_turn.texts && s_turn.texts[i * TEXT_MAX] && s_turn.mp3 && stackchan_tts_begin(s_turn.texts + i * TEXT_MAX)) {
++            m.pcm_start = s_turn.pcm_out;
++            m.pcm_frames = 0;
++            m.tts = TTS_ACTIVE;
++            s_turn.tts_msg = i;
++            s_turn.silent = false;
++            s_turn.mp3_len = 0;
++            s_turn.mp3_ended = false;
++            s_turn.kbps = 0;
++            s_turn.down_rate = 0;
++            mp3dec_init(&s_turn.dec);
++            s_turn.sc_tts = true;
++            ESP_LOGI(TAG, "speaking message %s via Google TTS (%u chars)", m.id, (unsigned)m.len);
++            show_reply_start(m);
++            return;
++        }
+         m.pcm_start = s_turn.pcm_out;
+         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
+          * was kept at reading pace, not stretched over the whole reply's time
+@@ -1673,6 +1692,33 @@ static void decode(void)
+     if (s_turn.tts_msg < 0) {
+         return;
+     }
++    if (s_turn.sc_tts && !s_turn.silent) {
++        bool ended = false, failed = false;
++        while (s_turn.mp3_len < MP3_BUF) {
++            size_t room = MP3_BUF - s_turn.mp3_len;
++            size_t n = stackchan_tts_read(s_turn.mp3 + s_turn.mp3_len, room < 4096 ? room : 4096, &ended, &failed);
++            if (!n) {
++                break;
++            }
++            mark(M_MP3);
++            s_turn.mp3_len += n;
++        }
++        if (ended) {
++            s_turn.sc_tts = false;
++            if (failed && !s_turn.mp3_len && !s_turn.down_rate) {
++                /* TTS failed before any audio: show the text at reading pace instead. */
++                msg_t &fm = s_turn.msgs[s_turn.tts_msg];
++                size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + s_turn.tts_msg * TEXT_MAX) : fm.len;
++                fm.pcm_start = s_turn.pcm_out;
++                fm.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
++                s_turn.silent = true;
++                ESP_LOGW(TAG, "Google TTS failed, showing text only");
++                pace_silently();
++                return;
++            }
++            s_turn.mp3_ended = true;
++        }
++    }
+     if (s_turn.silent) {
+         pace_silently();
+         return;
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+index 7818684..3a9d7d2 100644
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -49,6 +49,7 @@ set(GADGET_SRCS
+ )
+ 
+ set(GADGET_REQUIRES
++    stackchan_tts
+     nvs_flash
+     esp_wifi
+     esp_event
+diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
+index 1602c22..c079f51 100644
+--- a/esp32/main/sdk_token_console.c
++++ b/esp32/main/sdk_token_console.c
+@@ -29,6 +29,7 @@
+ #include "soc/soc_caps.h"
+ 
+ #include "identity.h"
++#include "stackchan_tts.h"
+ 
+ // The chip's own USB port, where it has one and the log goes to it.
+ #define USJ_CONSOLE (SOC_USB_SERIAL_JTAG_SUPPORTED && \
+@@ -44,6 +45,7 @@ static const char *TAG = "link.sdk_token";
+ #define COMMAND_LINE_MAX 96
+ 
+ bool sdk_token_console_command(const char *line) {
++    if (stackchan_tts_console_command(line)) return true;
+     if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
+     const char *token = line + strlen(COMMAND);
+     if (!identity_sdk_token_valid(token)) {
+
