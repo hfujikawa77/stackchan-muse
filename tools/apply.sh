@@ -13,9 +13,12 @@ if [ -f "$HERE/avatar/muse_pixel.c" ]; then
 fi
 
 # 独自コンポーネント
-rm -rf "$ESP/components/stackchan_hw"
-cp -r "$HERE/components/stackchan_hw" "$ESP/components/stackchan_hw"
-echo "components: stackchan_hw copied"
+for c in "$HERE"/components/*/; do
+  n="$(basename "$c")"
+  rm -rf "$ESP/components/$n"
+  cp -r "$c" "$ESP/components/$n"
+  echo "components: $n copied"
+done
 
 # 追加 sdkconfig（patches/0001 で board.sh が読み込む）
 cp "$HERE/sdkconfig.stackchan" "$ESP/devices/sdkconfig.stackchan"
