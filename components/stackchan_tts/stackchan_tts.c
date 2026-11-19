@@ -255,7 +255,7 @@ static esp_http_client_handle_t get_client(void) {
 // Opens the TLS connection ahead of the first request.
 static void warm(void) {
     if (!stackchan_tts_enabled()) return;
-    if (s_h && esp_timer_get_time() - s_last_us < 20LL * 1000000) return;   // still warm
+    if (s_h && esp_timer_get_time() - s_last_us < 5LL * 1000000) return;   // still warm (Google closes idle connections within seconds)
     esp_http_client_handle_t h = get_client();
     if (!h) return;
     s_r.len = 0;
