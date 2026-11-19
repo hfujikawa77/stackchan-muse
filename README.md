@@ -6,13 +6,13 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 
 ## 構成
 - `avatar/muse_pixel.c` ... ｽﾀｯｸﾁｬﾝ風アバターのレンダラ（SDK の `components/muse/avatar/` へコピー。上流側では gitignore 対象）
-- `components/stackchan_hw/` ... サーボ・頭タッチ・LED のドライバ（ESP-IDF コンポーネント）
+- `components/stackchan_hw/` ... サーボ・LED のドライバ（ESP-IDF コンポーネント。頭タッチは未実装）
 - `components/stackchan_tts/` ... Google Cloud TTS による読み上げ
-- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS）
+- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS、`0003` サーボ・LED のコマンド）
 - `sdkconfig.stackchan` ... CoreS3 向けの追加 sdkconfig
 - `tools/apply.sh` / `tools/build.sh` ... 反映とビルド（WSL）
 - `tools/flash.ps1` ... ビルド → 書き込みを1コマンドで行う（Windows）
-- `tools/make-tts-patch.py` ... `patches/0002` の再生成
+- `tools/make-tts-patch.py` / `tools/make-hw-patch.py` ... `patches/0002` / `0003` の再生成
 - `build-out/` ... ビルド成果物（gitignore 対象）
 
 ## 前提
@@ -68,6 +68,20 @@ python -c "import serial,getpass,time; k=getpass.getpass('tts key: '); s=serial.
 `@tts_key ok` で保存済み（再起動不要）。声は `>tts_voice=ja-JP-Neural2-C` のように変更できる（既定 `ja-JP-Neural2-B`）。キーの消去は `>tts_key=`。
 
 遅延対策として、Google への接続を保持し、PWR 押下時に直近 5 秒以内に使っていなければ先に接続を温める（prewarm）。最初のチャンクは短く切って再生を早める。チャンクごとの Wi-Fi RSSI がログに出る。
+
+## サーボ・LED
+Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`ms`。x/y を省くと正面）で動かす。
+シリアルからも試せる（`>` で始め、LF 付き1行で送る）:
+
+| コマンド | 内容 |
+|---|---|
+| `>led=R,G,B` | 12 個の LED を同じ色に（`0,0,0` で消灯） |
+| `>servo=X,Y[,MS]` | 首を動かす。X 60〜240（150 が正面）、Y 70〜90（90 が水平）。範囲外は丸める |
+| `>servo=center` / `off` / `on` | 正面へ / トルクを切る / 入れる |
+| `>py32r=REG[,LEN]` / `>i2cr=ADDR,REG[,LEN]` | デバッグ用のレジスタ読み出し |
+
+- サーボの電源は PY32 のピン0（VM EN）、LED のデータ線は PY32 のピン13
+- LED は CoreS3 から本体への 5V（AW9523 の BUS_EN・BOOST_EN）で光る。esp-bsp がこの2ビットを消すので、ドライバが 300ms ごとに立て直している
 
 ## トラブルシュート
 ### Wi-Fi に繋がらない
