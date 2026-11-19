@@ -1,0 +1,139 @@
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -50,6 +50,7 @@
+ 
+ set(GADGET_REQUIRES
+     stackchan_tts
++    stackchan_hw
+     nvs_flash
+     esp_wifi
+     esp_event
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1354,6 +1354,13 @@
+ }
+ #endif
+ 
++static cJSON *int_param(const char *description) {
++    cJSON *param = cJSON_CreateObject();
++    cJSON_AddStringToObject(param, "type", "integer");
++    cJSON_AddStringToObject(param, "description", description);
++    return param;
++}
++
+ static void add_command(cJSON *commands, const char *name,
+                         const char *description,
+                         cJSON *required, cJSON *optional) {
+@@ -1410,6 +1417,23 @@
+                 "voltage, and whether it is charging or on USB power; each is "
+                 "null when the device has no battery or can't measure it",
+                 nullptr, nullptr);
++    {
++        cJSON *rgb = cJSON_CreateObject();
++        cJSON_AddItemToObject(rgb, "r", int_param("Red, 0 to 255."));
++        cJSON_AddItemToObject(rgb, "g", int_param("Green, 0 to 255."));
++        cJSON_AddItemToObject(rgb, "b", int_param("Blue, 0 to 255."));
++        add_command(commands, "stackchan.led",
++                    "Light all 12 LEDs of the Stack-chan body in one colour. 0,0,0 turns them off.",
++                    rgb, nullptr);
++        cJSON *pose = cJSON_CreateObject();
++        cJSON_AddItemToObject(pose, "x", int_param("Pan angle in degrees, 60 to 240; 150 is centre."));
++        cJSON_AddItemToObject(pose, "y", int_param("Tilt angle in degrees, 70 to 90; 90 is level."));
++        cJSON_AddItemToObject(pose, "ms", int_param("Time to get there in milliseconds, at least 150; default 600."));
++        add_command(commands, "stackchan.servo",
++                    "Move the Stack-chan head. With no x and y it returns to centre. "
++                    "Angles outside the safe range are clamped. Returns the angles it moved to.",
++                    nullptr, pose);
++    }
+ #if CONFIG_HOMEHUB_TUNNEL
+     add_command(commands, "device.discover",
+                 "Scan local network for devices (ARP, mDNS, SSDP, SNMP, NetBIOS)",
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -61,6 +61,7 @@
+ #include "image_fetch.h"
+ #include "noise_tunnel.h"
+ #include "led_status.h"
++#include "stackchan_hw.h"
+ #include "button.h"
+ #include "tunnel_netif.h"
+ #include "net_discovery.h"
+@@ -1941,6 +1942,57 @@
+ 
+ #endif  // CONFIG_HOMEHUB_BLE_COMMANDS
+ 
++/* stackchan.led / stackchan.servo: quick, so they run right here on the session task. */
++static int json_int(cJSON *params, const char *key, int fallback, bool *present) {
++    cJSON *item = params ? cJSON_GetObjectItem(params, key) : NULL;
++    if (present) *present = cJSON_IsNumber(item);
++    return cJSON_IsNumber(item) ? item->valueint : fallback;
++}
++
++static cJSON *stackchan_command(const char *command, cJSON *params) {
++    if (strcmp(command, "stackchan.led") == 0) {
++        bool r_ok, g_ok, b_ok;
++        int r = json_int(params, "r", 0, &r_ok);
++        int g = json_int(params, "g", 0, &g_ok);
++        int b = json_int(params, "b", 0, &b_ok);
++        if (!r_ok || !g_ok || !b_ok) return command_error("missing_param", "r, g and b are required");
++        if (!stackchan_led_ready()) return command_error("unavailable", "LEDs are not available");
++        r = r < 0 ? 0 : (r > 255 ? 255 : r);
++        g = g < 0 ? 0 : (g > 255 ? 255 : g);
++        b = b < 0 ? 0 : (b > 255 ? 255 : b);
++        if (stackchan_led_fill((uint8_t)r, (uint8_t)g, (uint8_t)b) != ESP_OK) {
++            return command_error("io_error", "LED update failed");
++        }
++        cJSON *result = cJSON_CreateObject();
++        cJSON_AddBoolToObject(result, "ok", true);
++        return result;
++    }
++    /* stackchan.servo */
++    if (!stackchan_servo_ready()) return command_error("unavailable", "servos are not available");
++    bool x_ok, y_ok, ms_ok;
++    int x = json_int(params, "x", STACKCHAN_SERVO_X_CENTER, &x_ok);
++    int y = json_int(params, "y", STACKCHAN_SERVO_Y_CENTER, &y_ok);
++    int ms = json_int(params, "ms", 600, &ms_ok);
++    if (ms < 0) ms = 0;
++    int cur_x, cur_y;
++    stackchan_servo_position(&cur_x, &cur_y);
++    if (x_ok != y_ok) {   /* only one axis given: keep the other where it is */
++        if (!x_ok) x = cur_x;
++        if (!y_ok) y = cur_y;
++    }
++    if (stackchan_servo_move(x, y, (uint32_t)ms) != ESP_OK) {
++        return command_error("io_error", "servo move failed");
++    }
++    stackchan_servo_position(&x, &y);
++    cJSON *payload = cJSON_CreateObject();
++    cJSON_AddNumberToObject(payload, "x", x);
++    cJSON_AddNumberToObject(payload, "y", y);
++    cJSON *result = cJSON_CreateObject();
++    cJSON_AddBoolToObject(result, "ok", true);
++    cJSON_AddItemToObject(result, "payload", payload);
++    return result;
++}
++
+ static cJSON *on_ws_command(
+     const char *command, cJSON *params, const char *request_id,
+     noise_ctrl_session_generation_t session_generation) {
+@@ -1949,6 +2001,9 @@
+         return ble_commands_handle(command, params, request_id, session_generation);
+     }
+ #endif
++    if (strcmp(command, "stackchan.led") == 0 || strcmp(command, "stackchan.servo") == 0) {
++        return stackchan_command(command, params);
++    }
+     if (strcmp(command, "device.list_vms") == 0) {
+         return list_vms_command();
+     }
+@@ -2858,6 +2913,7 @@
+ #if CONFIG_HOMEHUB_VOICE
+     voice_init();
+ #endif
++    stackchan_hw_init();
+ #if CONFIG_HOMEHUB_SENSECAP_SENSORS
+     sensecap_sensors_init();
+ #endif
