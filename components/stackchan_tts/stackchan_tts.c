@@ -187,7 +187,7 @@ static int speak_chunk(esp_http_client_handle_t h, resp_t *r, const char *voice,
     json_escape(txt, n, esc);
     snprintf(body, bl,
              "{\"input\":{\"text\":\"%s\"},\"voice\":{\"languageCode\":\"%s\",\"name\":\"%s\"},"
-             "\"audioConfig\":{\"audioEncoding\":\"MP3\"}}", esc, lang, voice);
+             "\"audioConfig\":{\"audioEncoding\":\"MP3\",\"pitch\":4.0}}", esc, lang, voice);
     free(esc);
     r->len = 0;
     r->over = false;
