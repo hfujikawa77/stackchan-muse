@@ -43,8 +43,13 @@ esp_err_t stackchan_servo_center(uint32_t ms);
 esp_err_t stackchan_servo_torque(bool on);
 void stackchan_servo_position(int *x_deg, int *y_deg);   // last commanded
 
+// Speech animation (#10): muse_audio_write() calls this with the 0..1 level of each chunk
+// it plays. While speaking, the LEDs follow the level and the head sways; on by default.
+void stackchan_hw_audio_level(float level);
+void stackchan_hw_set_speech_anim(bool on);
+
 // Serial console test commands, without the Muse app:
-//   >led=R,G,B   >servo=X,Y[,MS]   >servo=center   >servo=off (torque off)   >servo=on
+//   >led=R,G,B   >servo=X,Y[,MS]   >servo=center   >servo=off (torque off)   >servo=on   >anim=0|1
 // Returns true if the line was one of these.
 bool stackchan_hw_console_command(const char *line);
 

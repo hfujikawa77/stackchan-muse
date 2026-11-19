@@ -156,3 +156,34 @@ diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
      if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
      const char *token = line + strlen(COMMAND);
      if (!identity_sdk_token_valid(token)) {
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -200,7 +200,7 @@
+     # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
+     # before Kconfig values exist, so these can't depend on it; only the code does.
+     fatfs esp_driver_sdspi sdmmc)
+-list(APPEND muse_priv_requires camera stackchan_tts)
++list(APPEND muse_priv_requires camera stackchan_tts stackchan_hw)
+ # The P4 camera's JPEG encoder; Kconfig is not loaded yet when requirements expand.
+ if(IDF_TARGET STREQUAL "esp32p4")
+     list(APPEND muse_priv_requires esp_driver_jpeg)
+diff --git a/esp32/components/muse/muse_audio.c b/esp32/components/muse/muse_audio.c
+--- a/esp32/components/muse/muse_audio.c
++++ b/esp32/components/muse/muse_audio.c
+@@ -32,6 +32,7 @@
+ #include "muse_board.h"
+ #include "muse_mem.h"
+ #include "muse_settings.h"
++#include "stackchan_hw.h"
+ 
+ static const char *TAG = "muse_audio";
+ 
+@@ -430,6 +431,7 @@
+     bool mute = !muse_settings_speaker_on();
+     while (frames) {
+         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
++        stackchan_hw_audio_level(muse_audio_level(mono, n));   /* speech animation */
+         for (size_t i = 0; i < n; i++) {
+             s_out_stereo[2 * i] = mute ? 0 : mono[i];
+             s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];

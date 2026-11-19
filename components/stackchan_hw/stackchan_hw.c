@@ -1,11 +1,13 @@
 #include "stackchan_hw.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -63,6 +65,31 @@ static bool s_inited;
 static uint8_t s_led_ram[STACKCHAN_LED_COUNT * 2];
 static int s_x = STACKCHAN_SERVO_X_CENTER;
 static int s_y = STACKCHAN_SERVO_Y_CENTER;
+
+// ---- speech animation (#10) ---------------------------------------------------
+// muse_audio_write() reports the level of every 20 ms it plays. Sound that lasts
+// VOICE_START_MS counts as speech (so a 90 ms UI chirp does not), and speech ends after
+// VOICE_HOLD_MS of quiet. While speaking the LEDs follow the level and the head sways a
+// little; afterwards both go back to how they were.
+#define ANIM_TICK_MS     50
+#define VOICE_LEVEL_MIN  0.08f
+#define VOICE_START_MS   300
+#define VOICE_HOLD_MS    1500   // quiet this long ends speech; shorter pauses between sentences do not
+#define SWAY_DEG         8.0f    // amplitude either side of where the head was
+#define SWAY_PERIOD_S    1.8f    // one full left-right-left
+#define SWAY_RAMP_S      0.6f    // amplitude grows over this, so the start is gentle
+#define SWAY_STEP_MS     100     // each 50 ms step is given 100 ms, so moves overlap smoothly
+#define SPEAK_R 255
+#define SPEAK_G 120
+#define SPEAK_B 60
+
+static volatile bool s_voice_seen;
+static volatile uint32_t s_voice_last_ms;   // last chunk above VOICE_LEVEL_MIN
+static volatile uint32_t s_voice_run_ms;    // start of the current run of sound
+static volatile float s_level;
+static volatile bool s_anim_on = true;
+
+static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static esp_err_t py32_write(uint8_t reg, const uint8_t *data, size_t len) {
     uint8_t buf[1 + sizeof(s_led_ram)];
@@ -138,6 +165,25 @@ static void scs_write_pos(uint8_t id, int deg, uint32_t ms) {
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// For animation: small steps sent often, in fractions of a degree, with no minimum time.
+static void servo_track(float x, float y, uint32_t ms) {
+    if (!s_servo_ready) return;
+    x = clampf(x, STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX);
+    y = clampf(y, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX);
+    uint16_t px = (uint16_t)lroundf(1023.0f - x * 1023.0f / 300.0f);
+    uint16_t py = (uint16_t)lroundf(1023.0f - y * 1023.0f / 300.0f);
+    uint8_t dx[6] = {(uint8_t)(px >> 8), (uint8_t)px, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
+    uint8_t dy[6] = {(uint8_t)(py >> 8), (uint8_t)py, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dx, sizeof(dx), true);
+    scs_send(SCS_ID_Y, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dy, sizeof(dy), true);
+    s_x = (int)lroundf(x);
+    s_y = (int)lroundf(y);
+    xSemaphoreGive(s_lock);
+}
+
 // Sets BUS_EN / BOOST_EN if either is clear. Read and write back to back, so a bit the
 // BSP changed just before is kept. Returns true if it had to change anything.
 static bool bus_5v_assert(void) {
@@ -154,13 +200,86 @@ static bool bus_5v_assert(void) {
     return changed;
 }
 
-static void bus_guard_task(void *arg) {
+static void led_fill_buffer(uint8_t r, uint8_t g, uint8_t b) {
+    for (uint8_t i = 0; i < STACKCHAN_LED_COUNT; i++) stackchan_led_set(i, r, g, b);
+}
+
+// One task for the 5 V guard and the speech animation, to keep internal RAM down.
+static void hw_task(void *arg) {
     (void)arg;
+    uint32_t guard_ms = 0, speak_start = 0;
+    bool speaking = false;
+    uint8_t saved_led[sizeof(s_led_ram)];
+    int saved_x = STACKCHAN_SERVO_X_CENTER, saved_y = STACKCHAN_SERVO_Y_CENTER;
+    float smooth = 0;
+    int shown = -1;
+    uint32_t prev = now_ms(), max_gap = 0, ticks = 0, late = 0;   // timing stats per speech
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(BUS_GUARD_MS));
-        if (bus_5v_assert() && s_led_ready) {
-            vTaskDelay(pdMS_TO_TICKS(20));   // LEDs lose their colour without power: send it again
-            stackchan_led_show();
+        vTaskDelay(pdMS_TO_TICKS(ANIM_TICK_MS));
+        uint32_t now = now_ms();
+        uint32_t gap = now - prev;
+        prev = now;
+
+        guard_ms += ANIM_TICK_MS;
+        if (s_aw9523 && guard_ms >= BUS_GUARD_MS) {
+            guard_ms = 0;
+            if (bus_5v_assert() && s_led_ready) {
+                vTaskDelay(pdMS_TO_TICKS(20));   // LEDs lose their colour without power: send it again
+                stackchan_led_show();
+            }
+        }
+
+        uint32_t last = s_voice_last_ms, run = s_voice_run_ms;
+        bool voice = s_anim_on && s_voice_seen && (now - last) < VOICE_HOLD_MS &&
+                     (speaking || (last - run) >= VOICE_START_MS);
+
+        if (voice && !speaking) {
+            speaking = true;
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            memcpy(saved_led, s_led_ram, sizeof(saved_led));
+            xSemaphoreGive(s_lock);
+            stackchan_servo_position(&saved_x, &saved_y);
+            smooth = 0;
+            shown = -1;
+            speak_start = now;
+            max_gap = 0;
+            ticks = 0;
+            late = 0;
+        } else if (!voice && speaking) {
+            speaking = false;
+            if (s_led_ready) {
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                memcpy(s_led_ram, saved_led, sizeof(saved_led));
+                xSemaphoreGive(s_lock);
+                stackchan_led_show();
+            }
+            if (s_servo_ready) stackchan_servo_move(saved_x, saved_y, 500);
+            ESP_LOGI(TAG, "speech anim: %.1f s, %u ticks, max gap %u ms, %u ticks over 80 ms",
+                     (now - speak_start) / 1000.0f, (unsigned)ticks, (unsigned)max_gap, (unsigned)late);
+            continue;
+        }
+        if (!speaking) continue;
+        ticks++;
+        if (gap > max_gap) max_gap = gap;
+        if (gap > 80) late++;
+
+        if (s_led_ready) {
+            float l = s_level;
+            smooth = l > smooth ? 0.5f * smooth + 0.5f * l : 0.75f * smooth + 0.25f * l;   // fast up, slow down
+            int br = 30 + (int)(smooth * 225.0f);
+            if (shown < 0 || br - shown >= 8 || shown - br >= 8) {
+                led_fill_buffer((uint8_t)(SPEAK_R * br / 255), (uint8_t)(SPEAK_G * br / 255), (uint8_t)(SPEAK_B * br / 255));
+                stackchan_led_show();
+                shown = br;
+            }
+        }
+        if (s_servo_ready) {
+            // A sine sway, sent as small steps: the servo eases through each turn instead of
+            // stopping dead at the ends.
+            float t = (now - speak_start) / 1000.0f;
+            float amp = SWAY_DEG * (t < SWAY_RAMP_S ? t / SWAY_RAMP_S : 1.0f);
+            float x = saved_x + amp * sinf(2.0f * (float)M_PI * t / SWAY_PERIOD_S);
+            servo_track(x, (float)saved_y, SWAY_STEP_MS);
         }
     }
 }
@@ -206,8 +325,8 @@ esp_err_t stackchan_hw_init(void) {
     if (i2c_master_bus_add_device(bus, &aw, &s_aw9523) == ESP_OK) {
         bus_5v_assert();
         vTaskDelay(pdMS_TO_TICKS(50));
-        if (xTaskCreate(bus_guard_task, "sc_bus5v", 2560, NULL, 2, NULL) != pdPASS) {
-            ESP_LOGW(TAG, "5V guard task not started");
+        if (xTaskCreate(hw_task, "sc_hw", 3072, NULL, 2, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "hw task not started (5V guard, speech animation)");
         }
     } else {
         ESP_LOGW(TAG, "AW9523 not added; LEDs may stay dark");
@@ -365,6 +484,9 @@ bool stackchan_hw_console_command(const char *line) {
             for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
             printf("\n");
         }
+    } else if (!strncmp(line, "anim=", 5)) {
+        stackchan_hw_set_speech_anim(line[5] == '1');
+        printf("@anim %s\n", line[5] == '1' ? "on" : "off");
     } else if (!strncmp(line, "led=", 4)) {
         if (sscanf(line + 4, "%d,%d,%d", &a, &b, &c) != 3) {
             printf("@led usage: >led=R,G,B\n");
@@ -393,3 +515,14 @@ bool stackchan_hw_console_command(const char *line) {
     fflush(stdout);
     return true;
 }
+
+void stackchan_hw_audio_level(float level) {
+    s_level = level;
+    if (level < VOICE_LEVEL_MIN) return;
+    uint32_t now = now_ms();
+    if (!s_voice_seen || now - s_voice_last_ms > VOICE_HOLD_MS) s_voice_run_ms = now;
+    s_voice_last_ms = now;
+    s_voice_seen = true;
+}
+
+void stackchan_hw_set_speech_anim(bool on) { s_anim_on = on; }

@@ -7,7 +7,8 @@ import sys, pathlib, subprocess, tempfile, shutil
 
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
-FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c", "main/sdk_token_console.c"]
+FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c", "main/sdk_token_console.c",
+         "components/muse/CMakeLists.txt", "components/muse/muse_audio.c"]
 
 
 def sub1(s, old, new):
@@ -122,7 +123,27 @@ def console(s):
                 "    if (stackchan_tts_console_command(line)) return true;\n    if (stackchan_hw_console_command(line)) return true;\n")
 
 
-EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app, "main/sdk_token_console.c": console}
+def muse_cmake(s):
+    return sub1(s, "list(APPEND muse_priv_requires camera stackchan_tts)",
+                "list(APPEND muse_priv_requires camera stackchan_tts stackchan_hw)")
+
+
+def muse_audio(s):
+    s = sub1(s, '#include "muse_settings.h"\n', '#include "muse_settings.h"\n#include "stackchan_hw.h"\n')
+    old = ("    while (frames) {\n"
+           "        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
+           "        for (size_t i = 0; i < n; i++) {\n"
+           "            s_out_stereo[2 * i] = mute")
+    new = ("    while (frames) {\n"
+           "        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
+           "        stackchan_hw_audio_level(muse_audio_level(mono, n));   /* speech animation */\n"
+           "        for (size_t i = 0; i < n; i++) {\n"
+           "            s_out_stereo[2 * i] = mute")
+    return sub1(s, old, new)
+
+
+EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app, "main/sdk_token_console.c": console,
+         "components/muse/CMakeLists.txt": muse_cmake, "components/muse/muse_audio.c": muse_audio}
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 try:
