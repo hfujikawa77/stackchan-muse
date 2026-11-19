@@ -1,5 +1,6 @@
 #include "stackchan_hw.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
@@ -23,9 +24,11 @@ extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 #define REG_GPIO_O_L      0x05   // output level
 #define REG_GPIO_PU_L     0x09   // pull-up
 #define REG_GPIO_PD_L     0x0B   // pull-down
+#define REG_GPIO_DRV_L    0x13   // drive mode, 1 = open drain
 #define REG_LED_CFG       0x24   // bits 0..5 count, bit 6 refresh
 #define REG_LED_RAM_START 0x30   // RGB565, little endian, 2 bytes per LED
-#define SERVO_DIR_PIN     0      // half-duplex direction pin on the PY32
+#define PIN_SERVO_POWER   0      // PY32 pin 0 = VM EN: powers the servos
+#define PIN_LED_DATA      13     // PY32 pin 13 = RGB LED data line (push-pull, pulled up)
 
 // ---- Servo bus (SCS0009, 1 Mbps) -------------------------------------------
 #define SERVO_UART       UART_NUM_1
@@ -157,17 +160,21 @@ esp_err_t stackchan_hw_init(void) {
     }
     ESP_LOGI(TAG, "PY32 version 0x%02X", ver);
 
-    // LEDs
+    // LEDs: the data pin must be an output, pulled up, push-pull before the LED engine drives it.
+    py32_bit(REG_GPIO_M_L, PIN_LED_DATA, true);
+    py32_bit(REG_GPIO_PD_L, PIN_LED_DATA, false);
+    py32_bit(REG_GPIO_PU_L, PIN_LED_DATA, true);
+    py32_bit(REG_GPIO_DRV_L, PIN_LED_DATA, false);
     py32_write8(REG_LED_CFG, STACKCHAN_LED_COUNT & 0x3F);
     memset(s_led_ram, 0, sizeof(s_led_ram));
     s_led_ready = true;
     stackchan_led_show();
 
-    // Servo bus: PY32 pin 0 high (output, pulled up) enables the half-duplex line, then the UART.
-    py32_bit(REG_GPIO_M_L, SERVO_DIR_PIN, true);
-    py32_bit(REG_GPIO_PD_L, SERVO_DIR_PIN, false);
-    py32_bit(REG_GPIO_PU_L, SERVO_DIR_PIN, true);
-    py32_bit(REG_GPIO_O_L, SERVO_DIR_PIN, true);
+    // Servos: switch their power on (PY32 pin 0, output, pulled up, high), then open the UART.
+    py32_bit(REG_GPIO_M_L, PIN_SERVO_POWER, true);
+    py32_bit(REG_GPIO_PD_L, PIN_SERVO_POWER, false);
+    py32_bit(REG_GPIO_PU_L, PIN_SERVO_POWER, true);
+    py32_bit(REG_GPIO_O_L, PIN_SERVO_POWER, true);
     vTaskDelay(pdMS_TO_TICKS(200));
 
     uart_config_t uc = {
@@ -257,4 +264,51 @@ esp_err_t stackchan_servo_torque(bool on) {
 void stackchan_servo_position(int *x_deg, int *y_deg) {
     if (x_deg) *x_deg = s_x;
     if (y_deg) *y_deg = s_y;
+}
+
+bool stackchan_hw_console_command(const char *line) {
+    int a, b, c, d = 600;
+    if (!strncmp(line, "py32r=", 6)) {   // debug: >py32r=REG[,LEN] prints PY32 registers
+        int len = 1;
+        if (!s_led_ready || sscanf(line + 6, "%i,%d", &a, &len) < 1 || a < 0 || a > 0xFF) {
+            printf("@py32r usage: >py32r=REG[,LEN]\n");
+        } else {
+            if (len < 1) len = 1;
+            if (len > 32) len = 32;
+            uint8_t buf[32] = {0};
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            uint8_t reg = (uint8_t)a;
+            esp_err_t err = i2c_master_transmit_receive(s_py32, &reg, 1, buf, len, 200);
+            xSemaphoreGive(s_lock);
+            printf("@py32r 0x%02X %s:", a, err == ESP_OK ? "ok" : esp_err_to_name(err));
+            for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
+            printf("\n");
+        }
+    } else if (!strncmp(line, "led=", 4)) {
+        if (sscanf(line + 4, "%d,%d,%d", &a, &b, &c) != 3) {
+            printf("@led usage: >led=R,G,B\n");
+        } else {
+            esp_err_t err = stackchan_led_fill((uint8_t)clampi(a, 0, 255), (uint8_t)clampi(b, 0, 255), (uint8_t)clampi(c, 0, 255));
+            printf("@led %s\n", err == ESP_OK ? "ok" : esp_err_to_name(err));
+        }
+    } else if (!strncmp(line, "servo=", 6)) {
+        const char *v = line + 6;
+        esp_err_t err;
+        if (!strcmp(v, "center")) err = stackchan_servo_center(800);
+        else if (!strcmp(v, "off")) err = stackchan_servo_torque(false);
+        else if (!strcmp(v, "on")) err = stackchan_servo_torque(true);
+        else if (sscanf(v, "%d,%d,%d", &a, &b, &d) >= 2) err = stackchan_servo_move(a, b, (uint32_t)(d < 0 ? 0 : d));
+        else {
+            printf("@servo usage: >servo=X,Y[,MS] | center | off | on\n");
+            fflush(stdout);
+            return true;
+        }
+        int x, y;
+        stackchan_servo_position(&x, &y);
+        printf("@servo %s x=%d y=%d\n", err == ESP_OK ? "ok" : esp_err_to_name(err), x, y);
+    } else {
+        return false;
+    }
+    fflush(stdout);
+    return true;
 }

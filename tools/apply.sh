@@ -25,12 +25,16 @@ cp "$HERE/sdkconfig.stackchan" "$ESP/devices/sdkconfig.stackchan"
 echo "sdkconfig: copied"
 
 # パッチ（適用済みならスキップ）
+# パッチは重なる（0003 は 0002 と同じファイルを触る）ので、適用済みのものを後ろから外してから、前から入れ直す。
 shopt -s nullglob
-for p in "$HERE"/patches/*.patch; do
+patches=("$HERE"/patches/*.patch)
+for ((i=${#patches[@]}-1; i>=0; i--)); do
+  p="${patches[$i]}"
   if git -C "$SDK_DIR" apply --reverse --check "$p" >/dev/null 2>&1; then
-    echo "patch: already applied $(basename "$p")"
-  else
-    git -C "$SDK_DIR" apply "$p"
-    echo "patch: applied $(basename "$p")"
+    git -C "$SDK_DIR" apply --reverse "$p"
   fi
+done
+for p in "${patches[@]}"; do
+  git -C "$SDK_DIR" apply "$p"
+  echo "patch: applied $(basename "$p")"
 done

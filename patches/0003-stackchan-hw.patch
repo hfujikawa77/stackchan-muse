@@ -137,3 +137,22 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  #if CONFIG_HOMEHUB_SENSECAP_SENSORS
      sensecap_sensors_init();
  #endif
+diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
+--- a/esp32/main/sdk_token_console.c
++++ b/esp32/main/sdk_token_console.c
+@@ -30,6 +30,7 @@
+ 
+ #include "identity.h"
+ #include "stackchan_tts.h"
++#include "stackchan_hw.h"
+ 
+ // The chip's own USB port, where it has one and the log goes to it.
+ #define USJ_CONSOLE (SOC_USB_SERIAL_JTAG_SUPPORTED && \
+@@ -46,6 +47,7 @@
+ 
+ bool sdk_token_console_command(const char *line) {
+     if (stackchan_tts_console_command(line)) return true;
++    if (stackchan_hw_console_command(line)) return true;
+     if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
+     const char *token = line + strlen(COMMAND);
+     if (!identity_sdk_token_valid(token)) {

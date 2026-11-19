@@ -43,6 +43,11 @@ esp_err_t stackchan_servo_center(uint32_t ms);
 esp_err_t stackchan_servo_torque(bool on);
 void stackchan_servo_position(int *x_deg, int *y_deg);   // last commanded
 
+// Serial console test commands, without the Muse app:
+//   >led=R,G,B   >servo=X,Y[,MS]   >servo=center   >servo=off (torque off)   >servo=on
+// Returns true if the line was one of these.
+bool stackchan_hw_console_command(const char *line);
+
 #ifdef __cplusplus
 }
 #endif

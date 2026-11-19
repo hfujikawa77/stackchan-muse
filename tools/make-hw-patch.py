@@ -7,7 +7,7 @@ import sys, pathlib, subprocess, tempfile, shutil
 
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
-FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c"]
+FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c", "main/sdk_token_console.c"]
 
 
 def sub1(s, old, new):
@@ -116,7 +116,13 @@ def app(s):
                 "#if CONFIG_HOMEHUB_VOICE\n    voice_init();\n#endif\n    stackchan_hw_init();\n")
 
 
-EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app}
+def console(s):
+    s = sub1(s, '#include "stackchan_tts.h"\n', '#include "stackchan_tts.h"\n#include "stackchan_hw.h"\n')
+    return sub1(s, "    if (stackchan_tts_console_command(line)) return true;\n",
+                "    if (stackchan_tts_console_command(line)) return true;\n    if (stackchan_hw_console_command(line)) return true;\n")
+
+
+EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app, "main/sdk_token_console.c": console}
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 try:
