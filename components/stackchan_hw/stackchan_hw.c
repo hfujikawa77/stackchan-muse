@@ -42,7 +42,20 @@ extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 #define SCSCL_TORQUE_ENABLE   40
 #define SCSCL_GOAL_POSITION_L 42
 
+// ---- CoreS3 AW9523 (0x58): 5 V out to the Stack-chan body ------------------
+// BUS_EN (P0 bit 1) and BOOST_EN (P1 bit 7) feed 5 V to the body, which the LEDs need
+// (the servos have their own VM switch). The esp-bsp rewrites P0/P1 from its own cache
+// whenever it toggles a rail (the speaker, for one), clearing both bits, so a small task
+// puts them back.
+#define AW9523_ADDR    0x58
+#define AW9523_OUT_P0  0x02
+#define AW9523_OUT_P1  0x03
+#define AW_BUS_EN      0x02
+#define AW_BOOST_EN    0x80
+#define BUS_GUARD_MS   300
+
 static i2c_master_dev_handle_t s_py32;
+static i2c_master_dev_handle_t s_aw9523;
 static SemaphoreHandle_t s_lock;
 static bool s_led_ready;
 static bool s_servo_ready;
@@ -125,6 +138,33 @@ static void scs_write_pos(uint8_t id, int deg, uint32_t ms) {
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// Sets BUS_EN / BOOST_EN if either is clear. Read and write back to back, so a bit the
+// BSP changed just before is kept. Returns true if it had to change anything.
+static bool bus_5v_assert(void) {
+    bool changed = false;
+    const uint8_t regs[2] = {AW9523_OUT_P0, AW9523_OUT_P1};
+    const uint8_t bits[2] = {AW_BUS_EN, AW_BOOST_EN};
+    for (int i = 0; i < 2; i++) {
+        uint8_t reg = regs[i], v;
+        if (i2c_master_transmit_receive(s_aw9523, &reg, 1, &v, 1, 100) != ESP_OK) continue;
+        if ((v & bits[i]) == bits[i]) continue;
+        uint8_t w[2] = {reg, (uint8_t)(v | bits[i])};
+        if (i2c_master_transmit(s_aw9523, w, 2, 100) == ESP_OK) changed = true;
+    }
+    return changed;
+}
+
+static void bus_guard_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(BUS_GUARD_MS));
+        if (bus_5v_assert() && s_led_ready) {
+            vTaskDelay(pdMS_TO_TICKS(20));   // LEDs lose their colour without power: send it again
+            stackchan_led_show();
+        }
+    }
+}
+
 // ---- public -----------------------------------------------------------------
 esp_err_t stackchan_hw_init(void) {
     if (s_inited) return s_led_ready ? ESP_OK : ESP_FAIL;
@@ -159,6 +199,19 @@ esp_err_t stackchan_hw_init(void) {
         return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "PY32 version 0x%02X", ver);
+
+    // 5 V to the body (LEDs), and keep it on
+    i2c_device_config_t aw = cfg;
+    aw.device_address = AW9523_ADDR;
+    if (i2c_master_bus_add_device(bus, &aw, &s_aw9523) == ESP_OK) {
+        bus_5v_assert();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (xTaskCreate(bus_guard_task, "sc_bus5v", 2560, NULL, 2, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "5V guard task not started");
+        }
+    } else {
+        ESP_LOGW(TAG, "AW9523 not added; LEDs may stay dark");
+    }
 
     // LEDs: the data pin must be an output, pulled up, push-pull before the LED engine drives it.
     py32_bit(REG_GPIO_M_L, PIN_LED_DATA, true);
@@ -268,7 +321,35 @@ void stackchan_servo_position(int *x_deg, int *y_deg) {
 
 bool stackchan_hw_console_command(const char *line) {
     int a, b, c, d = 600;
-    if (!strncmp(line, "py32r=", 6)) {   // debug: >py32r=REG[,LEN] prints PY32 registers
+    if (!strncmp(line, "i2cr=", 5) || !strncmp(line, "i2cw=", 5)) {
+        // debug: >i2cr=ADDR,REG[,LEN]   >i2cw=ADDR,REG,VAL   (writes only to the AW9523 at 0x58)
+        bool wr = line[3] == 'w';
+        int len = 1;
+        int n = sscanf(line + 5, "%i,%i,%i", &a, &b, &c);
+        i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+        if (!bus || n < 2 || a < 0x08 || a > 0x77 || b < 0 || b > 0xFF || (wr && (n < 3 || a != 0x58))) {
+            printf("@i2c usage: >i2cr=ADDR,REG[,LEN]  >i2cw=0x58,REG,VAL\n");
+        } else {
+            i2c_device_config_t dc = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = (uint16_t)a, .scl_speed_hz = 100000};
+            i2c_master_dev_handle_t dev;
+            esp_err_t err = i2c_master_bus_add_device(bus, &dc, &dev);
+            uint8_t buf[32] = {0};
+            if (err == ESP_OK) {
+                uint8_t reg = (uint8_t)b;
+                if (wr) {
+                    uint8_t w[2] = {reg, (uint8_t)c};
+                    err = i2c_master_transmit(dev, w, 2, 200);
+                } else {
+                    if (n >= 3) len = c < 1 ? 1 : (c > 32 ? 32 : c);
+                    err = i2c_master_transmit_receive(dev, &reg, 1, buf, len, 200);
+                }
+                i2c_master_bus_rm_device(dev);
+            }
+            printf("@i2c%c 0x%02X 0x%02X %s:", wr ? 'w' : 'r', a, b, err == ESP_OK ? "ok" : esp_err_to_name(err));
+            if (!wr) for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
+            printf("\n");
+        }
+    } else if (!strncmp(line, "py32r=", 6)) {   // debug: >py32r=REG[,LEN] prints PY32 registers
         int len = 1;
         if (!s_led_ready || sscanf(line + 6, "%i,%d", &a, &len) < 1 || a < 0 || a > 0xFF) {
             printf("@py32r usage: >py32r=REG[,LEN]\n");
