@@ -288,8 +288,7 @@ static void run_request(char *text, uint32_t gen) {
     bool first = true;
     int fails = 0;
     while (off < total && s_gen == gen && fails < 3) {
-        while (clean[off] == ' ' || clean[off] == '
-') off++;
+        while (clean[off] == ' ' || clean[off] == '\n') off++;
         if (off >= total) break;
         size_t n = next_chunk(clean + off, first ? FIRST_CHUNK_BYTES : CHUNK_BYTES);
         if (!n) break;
