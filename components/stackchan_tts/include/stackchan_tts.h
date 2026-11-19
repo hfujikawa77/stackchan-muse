@@ -10,6 +10,9 @@ extern "C" {
 // True when an API key is stored (set it over serial: ">tts_key=<key>").
 bool stackchan_tts_enabled(void);
 
+// Opens the connection to Google ahead of time (call when a turn starts). Returns at once.
+void stackchan_tts_prewarm(void);
+
 // Starts fetching speech for `text` in the background. Replaces any request in
 // flight. Returns false when TTS isn't configured or can't start.
 bool stackchan_tts_begin(const char *text);

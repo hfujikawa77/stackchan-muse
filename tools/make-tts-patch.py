@@ -32,6 +32,8 @@ edit("main/sdk_token_console.c", lambda s: sub1(
 
 def chat(s):
     s = sub1(s, '#include "muse_settings.h"\n', '#include "muse_settings.h"\n#include "stackchan_tts.h"\n')
+    s = sub1(s, "static void turn_begin(uint32_t gen)\n{\n    if (!turn_start(gen, false)) {\n        return;\n    }\n",
+             "static void turn_begin(uint32_t gen)\n{\n    if (!turn_start(gen, false)) {\n        return;\n    }\n    stackchan_tts_prewarm();   /* TLS to Google while the user is still talking */\n")
     s = sub1(s, "    bool mp3_ended;\n    mp3dec_t dec;",
              "    bool mp3_ended;\n    bool sc_tts;             /* MP3 is arriving from stackchan_tts */\n    int64_t sc_t0;           /* when that request started */\n    mp3dec_t dec;")
     # start_tts: try Google TTS first

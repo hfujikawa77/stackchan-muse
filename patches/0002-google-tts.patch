@@ -12,7 +12,7 @@ index 5c89865..d9e6796 100644
  if(IDF_TARGET STREQUAL "esp32p4")
      list(APPEND muse_priv_requires esp_driver_jpeg)
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 256b5b2..612e840 100644
+index 256b5b2..670b524 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -74,6 +74,7 @@ extern "C" {
@@ -32,7 +32,15 @@ index 256b5b2..612e840 100644
      mp3dec_t dec;
      resampler_t down;
      int kbps;
-@@ -1608,6 +1611,24 @@ static void start_tts(void)
+@@ -1063,6 +1066,7 @@ static void turn_begin(uint32_t gen)
+     if (!turn_start(gen, false)) {
+         return;
+     }
++    stackchan_tts_prewarm();   /* TLS to Google while the user is still talking */
+     if (VOICE_NOTE) {
+         if (!open_note()) {
+             disconnect("chat open failed");
+@@ -1608,6 +1612,24 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -57,7 +65,7 @@ index 256b5b2..612e840 100644
          m.pcm_start = s_turn.pcm_out;
          /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
           * was kept at reading pace, not stretched over the whole reply's time
-@@ -1673,6 +1694,37 @@ static void decode(void)
+@@ -1673,6 +1695,37 @@ static void decode(void)
      if (s_turn.tts_msg < 0) {
          return;
      }

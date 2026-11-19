@@ -25,7 +25,7 @@ static const char *TAG = "sc.tts";
 #define KEY_MAX 80
 #define VOICE_MAX 40
 #define DEFAULT_VOICE "ja-JP-Neural2-B"
-#define FIRST_CHUNK_BYTES 120   // short first piece so speech starts sooner
+#define FIRST_CHUNK_BYTES 72    // short first piece so speech starts sooner
 #define CHUNK_BYTES 260
 #define TEXT_LIMIT 6000         // bytes of a reply we will voice
 #define RESP_MAX (192 * 1024)
@@ -41,6 +41,13 @@ static volatile uint32_t s_ready_gen;  // request whose buffer state is valid
 static volatile bool s_done, s_got;
 
 typedef struct { uint8_t *buf; size_t len, cap; bool over; } resp_t;
+
+#define BASE_URL "https://texttospeech.googleapis.com/"
+#define IDLE_DROP_US (45LL * 1000000)   // drop a connection idle this long; the server will have closed it
+static esp_http_client_handle_t s_h;   // kept between requests so the TLS handshake is paid once
+static resp_t s_r;
+static int64_t s_last_us;
+static volatile bool s_prewarm;
 
 static bool nvs_get(const char *k, char *out, size_t cap) {
     nvs_handle_t h;
@@ -226,6 +233,42 @@ static int speak_chunk(esp_http_client_handle_t h, resp_t *r, const char *voice,
     return 1;
 }
 
+static void drop_client(void) {
+    if (s_h) esp_http_client_cleanup(s_h);
+    s_h = NULL;
+}
+
+// The kept connection, or a new one (not yet connected).
+static esp_http_client_handle_t get_client(void) {
+    if (s_h && esp_timer_get_time() - s_last_us > IDLE_DROP_US) drop_client();
+    if (!s_h) {
+        esp_http_client_config_t cfg = {
+            .url = BASE_URL, .timeout_ms = 8000, .crt_bundle_attach = esp_crt_bundle_attach,
+            .event_handler = on_http, .user_data = &s_r, .buffer_size = 2048, .keep_alive_enable = true,
+        };
+        s_h = esp_http_client_init(&cfg);
+        if (s_h) esp_http_client_set_header(s_h, "Content-Type", "application/json");
+    }
+    return s_h;
+}
+
+// Opens the TLS connection ahead of the first request.
+static void warm(void) {
+    if (!stackchan_tts_enabled()) return;
+    if (s_h && esp_timer_get_time() - s_last_us < 20LL * 1000000) return;   // still warm
+    esp_http_client_handle_t h = get_client();
+    if (!h) return;
+    s_r.len = 0;
+    s_r.over = false;
+    esp_http_client_set_url(h, BASE_URL);
+    esp_http_client_set_method(h, HTTP_METHOD_GET);
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = esp_http_client_perform(h);
+    s_last_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "prewarm: %s, %d ms", esp_err_to_name(err), (int)((s_last_us - t0) / 1000));
+    if (err != ESP_OK) drop_client();
+}
+
 static void run_request(char *text, uint32_t gen) {
     char key[KEY_MAX], voice[VOICE_MAX] = DEFAULT_VOICE, lang[8] = "ja-JP";
     if (!nvs_get("tts_key", key, sizeof key)) return;
@@ -240,42 +283,33 @@ static void run_request(char *text, uint32_t gen) {
     size_t total = sanitize(text, clean, TEXT_LIMIT);
 
     char url[160];
-    snprintf(url, sizeof url, "https://texttospeech.googleapis.com/v1/text:synthesize?key=%s", key);
-    resp_t r = {0};
-    esp_http_client_config_t cfg = {
-        .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 8000,
-        .crt_bundle_attach = esp_crt_bundle_attach, .event_handler = on_http, .user_data = &r,
-        .buffer_size = 2048, .keep_alive_enable = true,
-    };
-    esp_http_client_handle_t h = NULL;
+    snprintf(url, sizeof url, BASE_URL "v1/text:synthesize?key=%s", key);
     size_t off = 0;
     bool first = true;
     int fails = 0;
     while (off < total && s_gen == gen && fails < 3) {
-        while (clean[off] == ' ' || clean[off] == '\n') off++;
+        while (clean[off] == ' ' || clean[off] == '
+') off++;
         if (off >= total) break;
         size_t n = next_chunk(clean + off, first ? FIRST_CHUNK_BYTES : CHUNK_BYTES);
         if (!n) break;
-        if (!h) {
-            h = esp_http_client_init(&cfg);
-            if (!h) break;
-            esp_http_client_set_header(h, "Content-Type", "application/json");
-        }
-        int rc = speak_chunk(h, &r, voice, lang, clean + off, n, gen);
+        esp_http_client_handle_t h = get_client();
+        if (!h) break;
+        esp_http_client_set_url(h, url);
+        esp_http_client_set_method(h, HTTP_METHOD_POST);
+        int rc = speak_chunk(h, &s_r, voice, lang, clean + off, n, gen);
+        s_last_us = esp_timer_get_time();
         if (rc < 0) break;
         if (rc == 0) {
             // A fresh connection for the retry; the old one may be dead.
             fails++;
             ESP_LOGW(TAG, "retrying chunk (%d/3)", fails);
-            esp_http_client_cleanup(h);
-            h = NULL;
+            drop_client();
             continue;
         }
         first = false;
         off += n;
     }
-    if (h) esp_http_client_cleanup(h);
-    free(r.buf);
     free(clean);
     ESP_LOGI(TAG, "request %u done (audio=%d)", (unsigned)gen, (int)s_got);
 }
@@ -289,7 +323,13 @@ static void worker(void *arg) {
         uint32_t gen = s_pending_gen;
         s_pending = NULL;
         xSemaphoreGive(s_lock);
-        if (!text) continue;
+        if (!text) {
+            if (s_prewarm) {
+                s_prewarm = false;
+                warm();
+            }
+            continue;
+        }
         if (gen == s_gen) {
             xStreamBufferReset(s_sb);
             s_done = false;
@@ -302,17 +342,26 @@ static void worker(void *arg) {
     }
 }
 
-bool stackchan_tts_begin(const char *text) {
-    if (!text || !text[0] || !stackchan_tts_enabled()) return false;
-    if (!s_task) {
-        s_sb = xStreamBufferCreateWithCaps(SB_SIZE, 1, MALLOC_CAP_SPIRAM);
-        s_lock = xSemaphoreCreateMutex();
-        if (!s_sb || !s_lock) return false;
-        if (xTaskCreate(worker, "sc_tts", 10 * 1024, NULL, 4, &s_task) != pdPASS) {
-            s_task = NULL;
-            return false;
-        }
+static bool ensure_task(void) {
+    if (s_task) return true;
+    s_sb = xStreamBufferCreateWithCaps(SB_SIZE, 1, MALLOC_CAP_SPIRAM);
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_sb || !s_lock) return false;
+    if (xTaskCreate(worker, "sc_tts", 10 * 1024, NULL, 4, &s_task) != pdPASS) {
+        s_task = NULL;
+        return false;
     }
+    return true;
+}
+
+void stackchan_tts_prewarm(void) {
+    if (!stackchan_tts_enabled() || !ensure_task()) return;
+    s_prewarm = true;
+    xTaskNotifyGive(s_task);
+}
+
+bool stackchan_tts_begin(const char *text) {
+    if (!text || !text[0] || !stackchan_tts_enabled() || !ensure_task()) return false;
     char *copy = heap_caps_malloc(strlen(text) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!copy) return false;
     strcpy(copy, text);
