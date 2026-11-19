@@ -7,9 +7,13 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 ## 構成
 - `avatar/muse_pixel.c` ... ｽﾀｯｸﾁｬﾝ風アバターのレンダラ（SDK の `components/muse/avatar/` へコピー。上流側では gitignore 対象）
 - `components/stackchan_hw/` ... サーボ・頭タッチ・LED のドライバ（ESP-IDF コンポーネント）
-- `patches/` ... SDK への最小パッチ（Muse コマンド登録など）
+- `components/stackchan_tts/` ... Google Cloud TTS による読み上げ
+- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS）
 - `sdkconfig.stackchan` ... CoreS3 向けの追加 sdkconfig
-- `tools/apply.sh` / `tools/build.sh` ... 反映とビルド
+- `tools/apply.sh` / `tools/build.sh` ... 反映とビルド（WSL）
+- `tools/flash.ps1` ... ビルド → 書き込みを1コマンドで行う（Windows）
+- `tools/make-tts-patch.py` ... `patches/0002` の再生成
+- `build-out/` ... ビルド成果物（gitignore 対象）
 
 ## 前提
 - ESP-IDF **v6.0.3**（WSL2 Ubuntu に導入）
@@ -62,7 +66,20 @@ Cloud Text-to-Speech API を有効にした API キーを、シリアルから N
 python -c "import serial,getpass,time; k=getpass.getpass('tts key: '); s=serial.Serial('COM7',115200); s.write(('>tts_key='+k+'\n').encode()); time.sleep(2); print(s.read(1500).decode(errors='replace'))"
 ```
 `@tts_key ok` で保存済み（再起動不要）。声は `>tts_voice=ja-JP-Neural2-C` のように変更できる（既定 `ja-JP-Neural2-B`）。キーの消去は `>tts_key=`。
-- 元の HermesLLM に戻すときは、PlatformIO で `stackchan-arduino/examples/HermesLLM` を書き込む
+
+遅延対策として、Google への接続を保持し、PWR 押下時に直近 5 秒以内に使っていなければ先に接続を温める（prewarm）。最初のチャンクは短く切って再生を早める。チャンクごとの Wi-Fi RSSI がログに出る。
+
+## トラブルシュート
+### Wi-Fi に繋がらない
+シリアルログ（115200 bps）の `link.wifi` を見る。ハートビートが `wifi=down` のままなら未接続。
+- `disconnected reason=2`（AUTH_EXPIRE）が繰り返される ... 認証失敗。パスワード変更、AP 側が 5GHz 専用や WPA3 専用、接続台数の上限などを疑う。スマホのテザリングは 2.4GHz・WPA2 にする。RSSI が -70 dBm より良ければ電波は問題ない
+- 保存済みネットワークは Muse アプリ（BLE セットアップ）から設定し直せる
+
+### PC に COM ポートが出ない
+データ線のないケーブル、または別の USB ポートで解決することが多い。それでもだめなら RST ボタン長押しでブートローダーに入れる。
+
+## 元のファームに戻す
+HermesLLM に戻すときは、PlatformIO で `stackchan-arduino/examples/HermesLLM` を書き込む。
 
 ## ライセンス
 自作部分は Apache-2.0（`LICENSE`）。`patches/` は上流 muse-gadget-sdk（Apache-2.0）への差分で、上流の著作権表示はそのまま残る。m5stack-avatar (MIT) を参考/流用する場合は、ヘッダーとライセンス表記を残す。
