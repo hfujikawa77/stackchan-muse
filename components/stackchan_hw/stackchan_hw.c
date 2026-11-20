@@ -7,6 +7,7 @@
 
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -187,6 +188,54 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 // the target only sets where a mass-spring-damper is pulled, the ESP32 steps the spring
 // every 20 ms, and each step goes to the servo as a 20 ms move. The servo's own timed
 // moves are never relied on, so there is nothing for it to stop and restart.
+// ---- motion log: what aimed the head where, for >motionlog -------------------------
+// Every spring target, full turn and position read, with the source line. Kept in RTC
+// memory, so a software restart (>wifi=, a crash) does not lose it.
+#define MLOG_N     64
+#define MLOG_MAGIC 0x5C4A110Fu
+typedef struct {
+    uint32_t ms;
+    uint16_t line;
+    char what;      // 'x' / 'y' target, 'S' turn start, 'E' turn end, 'T' read (teleport), 'B' boot
+    int16_t tenths; // angle in tenths of a degree
+} mlog_entry_t;
+static RTC_NOINIT_ATTR struct {
+    uint32_t magic;
+    uint32_t next;
+    mlog_entry_t e[MLOG_N];
+} s_mlog;
+static portMUX_TYPE s_mlog_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void mlog_add(int line, char what, float deg) {
+    uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    taskENTER_CRITICAL(&s_mlog_mux);
+    if (s_mlog.magic != MLOG_MAGIC) {
+        memset(&s_mlog, 0, sizeof(s_mlog));
+        s_mlog.magic = MLOG_MAGIC;
+    }
+    mlog_entry_t *e = &s_mlog.e[s_mlog.next % MLOG_N];
+    e->ms = ms;
+    e->line = (uint16_t)line;
+    e->what = what;
+    e->tenths = (int16_t)lroundf(deg * 10.0f);
+    s_mlog.next++;
+    taskEXIT_CRITICAL(&s_mlog_mux);
+}
+
+static void mlog_print(void) {
+    taskENTER_CRITICAL(&s_mlog_mux);
+    bool ok = s_mlog.magic == MLOG_MAGIC;
+    uint32_t next = ok ? s_mlog.next : 0;
+    taskEXIT_CRITICAL(&s_mlog_mux);
+    uint32_t n = next < MLOG_N ? next : MLOG_N;
+    printf("@motionlog %u entries (ms since that boot, source line, what, deg)\n", (unsigned)n);
+    for (uint32_t i = next - n; i < next; i++) {
+        mlog_entry_t e = s_mlog.e[i % MLOG_N];
+        printf("@ml %8u L%-4u %c %6.1f\n", (unsigned)e.ms, (unsigned)e.line, e.what, e.tenths / 10.0f);
+    }
+    fflush(stdout);
+}
+
 typedef struct {
     float pos, vel, target;
     float k, c;        // stiffness and damping (unit mass)
@@ -198,7 +247,9 @@ static spring_t s_spy = {STACKCHAN_SERVO_Y_CENTER, 0, STACKCHAN_SERVO_Y_CENTER, 
 static portMUX_TYPE s_spring_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Critically damped, tuned so a move settles in about `ms` (to ~2 % at 5.8 / omega).
-static void spring_aim(spring_t *sp, float target, uint32_t ms) {
+// Called through spring_aim(), which logs the caller's line.
+static void spring_aim_at(spring_t *sp, float target, uint32_t ms, int line) {
+    mlog_add(line, sp == &s_spx ? 'x' : 'y', target);
     float w = 5800.0f / (float)(ms ? ms : 1);
     w = clampf(w, 4.0f, 40.0f);
     taskENTER_CRITICAL(&s_spring_mux);
@@ -208,6 +259,7 @@ static void spring_aim(spring_t *sp, float target, uint32_t ms) {
     sp->active = true;
     taskEXIT_CRITICAL(&s_spring_mux);
 }
+#define spring_aim(sp, target, ms) spring_aim_at((sp), (target), (ms), __LINE__)
 
 static void spring_step(spring_t *sp, float dt) {
     if (!sp->active) return;
@@ -280,6 +332,7 @@ static void spin_x(bool on, int speed) {
         lim[2] = 0x03;
         lim[3] = 0xFF;
     }
+    mlog_add(__LINE__, on ? 'S' : 'E', (float)speed);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (on) s_spin_x = true;
     scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_MIN_ANGLE_LIMIT_L, lim, sizeof(lim), true);
@@ -346,6 +399,7 @@ static bool motion_teleport_to_present(void) {
     s_x = (int)lroundf(x);
     s_y = (int)lroundf(y);
     ESP_LOGI(TAG, "servo position x=%.1f y=%.1f", x, y);
+    mlog_add(__LINE__, 'T', x);
     return true;
 }
 
@@ -1020,6 +1074,7 @@ esp_err_t stackchan_hw_init(void) {
         ESP_LOGW(TAG, "head touch (Si12T) not found");
     }
     calib_load();
+    mlog_add(__LINE__, 'B', 0);
     s_uart_ok = true;
     int tries = 0;
     while (!servo_probe() && ++tries < 12) vTaskDelay(pdMS_TO_TICKS(150));   // up to ~2 s
@@ -1218,6 +1273,9 @@ bool stackchan_hw_console_command(const char *line) {
         s_fake_voice_until = now_ms() + (uint32_t)a * 1000;
         s_fake_voice = true;
         printf("@swaytest %d s\n", a);
+    } else if (!strcmp(line, "motionlog")) {
+        mlog_print();
+        return true;
     } else if (!strcmp(line, "touch")) {   // debug: the last head-touch reading
         uint8_t v = s_touch_raw;
         printf("@touch ready=%d raw=0x%02X front=%u mid=%u back=%u\n", s_touch_ready, v, v & 3, (v >> 2) & 3, (v >> 4) & 3);
