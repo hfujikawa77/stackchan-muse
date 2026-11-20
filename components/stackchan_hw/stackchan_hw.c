@@ -9,6 +9,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -215,7 +216,39 @@ static void spring_step(spring_t *sp, float dt) {
     }
 }
 
+// ---- centre calibration ------------------------------------------------------------
+// Each head sits a little differently on its servos. >servo=zero takes where the head is
+// now as the centre (X 150, Y 90) and keeps the difference in NVS, as the official firmware
+// keeps its zero positions. The rest of the code works in calibrated angles; only
+// servo_send() and scs_read_deg() see the servo's own.
+static float s_off_x, s_off_y;
+
+static void calib_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("stackchan", NVS_READONLY, &h) != ESP_OK) return;
+    int32_t zx = 0, zy = 0;
+    if (nvs_get_i32(h, "zero_x", &zx) == ESP_OK && nvs_get_i32(h, "zero_y", &zy) == ESP_OK) {
+        s_off_x = zx / 10.0f;
+        s_off_y = zy / 10.0f;
+        ESP_LOGI(TAG, "centre calibration: x%+.1f y%+.1f deg", s_off_x, s_off_y);
+    }
+    nvs_close(h);
+}
+
+static esp_err_t calib_save(void) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("stackchan", NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_i32(h, "zero_x", (int32_t)lroundf(s_off_x * 10.0f));
+    if (err == ESP_OK) err = nvs_set_i32(h, "zero_y", (int32_t)lroundf(s_off_y * 10.0f));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 static void servo_send(float x, float y) {
+    x += s_off_x;   // calibrated -> the servo's own angle
+    y += s_off_y;
     // Soft limits apply to targets (stackchan_servo_move, the sway). Here only the servo's own
     // range: a head that starts outside the soft limits is eased back by the spring, not snapped.
     x = clampf(x, 0.0f, 300.0f);
@@ -244,7 +277,7 @@ static void motion_tick(void) {
     if (moving) servo_send(x.pos, y.pos);
 }
 
-// Present position in degrees, or -1. The reply is FF FF id 04 <error> <pos hi> <pos lo> chk;
+// Present position in calibrated degrees, or -1. The reply is FF FF id 04 <error> <pos hi> <pos lo> chk;
 // our own echoed request has the READ instruction (0x02) where the reply has error 0.
 static float scs_read_deg(uint8_t id) {
     uint8_t len = 2;
@@ -255,7 +288,7 @@ static float scs_read_deg(uint8_t id) {
         if (buf[k] == 0xFF && buf[k + 1] == 0xFF && buf[k + 2] == id && buf[k + 3] == 4 && buf[k + 4] == 0x00) {
             int pos = (buf[k + 5] << 8) | buf[k + 6];
             if (pos < 0 || pos > 1023) return -1;
-            return (1023 - pos) * 300.0f / 1023.0f;
+            return (1023 - pos) * 300.0f / 1023.0f - (id == SCS_ID_X ? s_off_x : s_off_y);   // calibrated
         }
     }
     return -1;
@@ -475,6 +508,7 @@ esp_err_t stackchan_hw_init(void) {
         ESP_LOGE(TAG, "servo UART setup failed");
         return ESP_OK;   // LEDs still work
     }
+    calib_load();
     s_uart_ok = true;
     int tries = 0;
     while (!servo_probe() && ++tries < 12) vTaskDelay(pdMS_TO_TICKS(150));   // up to ~2 s
@@ -622,6 +656,55 @@ bool stackchan_hw_console_command(const char *line) {
     } else if (!strncmp(line, "servo=", 6)) {
         const char *v = line + 6;
         esp_err_t err;
+        if (!strcmp(v, "pos")) {   // debug: where the servos really are, and what the springs hold
+            float rx = -2, ry = -2;
+            if (s_uart_ok) {
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                rx = scs_read_deg(SCS_ID_X);
+                ry = scs_read_deg(SCS_ID_Y);
+                xSemaphoreGive(s_lock);
+            }
+            taskENTER_CRITICAL(&s_spring_mux);
+            spring_t sx = s_spx, sy = s_spy;
+            taskEXIT_CRITICAL(&s_spring_mux);
+            printf("@servo pos read x=%.1f y=%.1f | spring x=%.1f->%.1f%s y=%.1f->%.1f%s | ready=%d\n",
+                   rx, ry, sx.pos, sx.target, sx.active ? "*" : "", sy.pos, sy.target, sy.active ? "*" : "",
+                   s_servo_ready);
+            fflush(stdout);
+            return true;
+        }
+        if (!strcmp(v, "zero") || !strcmp(v, "zero_reset")) {
+            // >servo=zero: where the head is now becomes the centre (turn the torque off and
+            // set it by hand first). >servo=zero_reset forgets the calibration.
+            if (!s_servo_ready) {
+                printf("@servo zero: servos not ready\n");
+                fflush(stdout);
+                return true;
+            }
+            bool reset = v[4] == '_';
+            float rx = 0, ry = 0;
+            if (!reset) {
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                rx = scs_read_deg(SCS_ID_X);   // calibrated, with the current offsets
+                ry = scs_read_deg(SCS_ID_Y);
+                xSemaphoreGive(s_lock);
+                if (rx < 0 || ry < 0) {
+                    printf("@servo zero: could not read the servos\n");
+                    fflush(stdout);
+                    return true;
+                }
+            }
+            float raw_x = rx + s_off_x, raw_y = ry + s_off_y;   // the servo's own angles
+            s_off_x = reset ? 0 : raw_x - STACKCHAN_SERVO_X_CENTER;
+            s_off_y = reset ? 0 : raw_y - STACKCHAN_SERVO_Y_CENTER;
+            err = calib_save();
+            // The springs now hold the same physical place in the new angles.
+            motion_teleport_to_present();
+            printf("@servo zero %s: offset x%+.1f y%+.1f deg\n", err == ESP_OK ? "saved" : esp_err_to_name(err),
+                   s_off_x, s_off_y);
+            fflush(stdout);
+            return true;
+        }
         if (!strcmp(v, "center")) err = stackchan_servo_center(800);
         else if (!strcmp(v, "off")) err = stackchan_servo_torque(false);
         else if (!strcmp(v, "on")) err = stackchan_servo_torque(true);
