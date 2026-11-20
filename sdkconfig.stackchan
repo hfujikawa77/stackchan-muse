@@ -5,3 +5,7 @@
 CONFIG_MUSE_REALTIME_VOICE=y
 # 通話開始時に Muse が挨拶する（動作確認用。うるさければ n）
 CONFIG_MUSE_REALTIME_VOICE_GREETING=y
+
+# 返事の文字の日本語（かな・漢字）を表示する。無効だと □ になる。GNU Unifont 16x16、フラッシュ約 1.2 MB。
+# （Noto Sans SC の版は簡体字 GB2312 の範囲だけで、日本語の漢字が一部欠けるので使わない）
+CONFIG_MUSE_CJK_FONT=y

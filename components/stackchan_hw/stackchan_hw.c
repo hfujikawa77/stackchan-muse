@@ -1023,6 +1023,9 @@ esp_err_t stackchan_hw_init(void) {
     s_uart_ok = true;
     int tries = 0;
     while (!servo_probe() && ++tries < 12) vTaskDelay(pdMS_TO_TICKS(150));   // up to ~2 s
+    // A restart in the middle of a full turn leaves X in wheel mode (the servos keep their
+    // power across our restart); position writes would then set its speed. Back to positions.
+    if (s_servo_ready) spin_x(false, 0);
     if (s_servo_ready) ESP_LOGI(TAG, "servos answered (try %d)", tries + 1);
     else ESP_LOGW(TAG, "servos not answering yet; will keep trying every 5 s");
     return ESP_OK;

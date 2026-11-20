@@ -128,6 +128,10 @@ static cJSON *stackchan_command(const char *command, cJSON *params) {
 
 
 def app(s):
+    s = sub1(s, "#define WIFI_QUICK_MIN_RSSI     (-75)   // near enough to join without a full scan\n",
+             "#define WIFI_QUICK_MIN_RSSI     (-65)   // near enough to join without a full scan\n"
+             "                                        // stackchan-muse: was -75, which took a weak last-joined\n"
+             "                                        // network over a strong one; a full scan picks the strongest\n")
     s = sub1(s, '#include "led_status.h"\n', '#include "led_status.h"\n#include "stackchan_hw.h"\n')
     s = sub1(s, "static cJSON *on_ws_command(\n", HANDLER + "static cJSON *on_ws_command(\n")
     s = sub1(s, '    if (strcmp(command, "device.list_vms") == 0) {\n',
@@ -139,10 +143,70 @@ def app(s):
                 "#if CONFIG_HOMEHUB_VOICE\n    voice_init();\n#endif\n    stackchan_hw_init();\n")
 
 
+WIFI_CONSOLE = r"""/* stackchan-muse: Wi-Fi from a PC over the serial console, for when the phone can't.
+ *   >wifi=SSID,PASSWORD   save it first among the saved networks and restart to join it
+ *   >wifi_forget=SSID     forget a saved network
+ *   >wifi_list            the saved networks, in the order they are tried (no passwords)
+ * The SSID ends at the first comma; the password is the rest of the line. */
+static bool wifi_console_command(const char *line) {
+    if (!strcmp(line, "wifi_list")) {
+        wifi_known_list_t *list = malloc(sizeof(*list));
+        if (!list) {
+            printf("@wifi_list error no memory\n");
+        } else {
+            int n = wifi_known_load(list);
+            printf("@wifi_list %d:", n);
+            for (int i = 0; i < n; i++) printf(" [%d] %s%s", i + 1, list->nets[i].ssid, list->nets[i].hidden ? " (hidden)" : "");
+            printf("\n");
+            wifi_known_wipe(list);
+            free(list);
+        }
+        fflush(stdout);
+        return true;
+    }
+    if (!strncmp(line, "wifi_forget=", 12)) {
+        bool ok = wifi_known_forget(line + 12);
+        printf(ok ? "@wifi_forget ok %s\n" : "@wifi_forget error %s\n", line + 12);
+        fflush(stdout);
+        return true;
+    }
+    if (strncmp(line, "wifi=", 5) != 0) return false;
+    const char *ssid = line + 5;
+    const char *comma = strchr(ssid, ',');
+    size_t ssid_len = comma ? (size_t)(comma - ssid) : 0;
+    const char *pass = comma ? comma + 1 : "";
+    if (!comma || ssid_len == 0 || ssid_len > WIFI_KNOWN_SSID_MAX || strlen(pass) > WIFI_KNOWN_PASS_MAX) {
+        printf("@wifi error usage: >wifi=SSID,PASSWORD\n");
+        fflush(stdout);
+        return true;
+    }
+    char name[WIFI_KNOWN_SSID_MAX + 1];
+    memcpy(name, ssid, ssid_len);
+    name[ssid_len] = '\0';
+    if (!wifi_known_remember(name, pass, -1)) {
+        printf("@wifi error could not save\n");
+        fflush(stdout);
+        return true;
+    }
+    ESP_LOGI(TAG, "saved wifi network %s first; restarting to join it", name);
+    printf("@wifi ok %s (restarting)\n", name);
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return true;
+}
+
+"""
+
+
 def console(s):
-    s = sub1(s, '#include "stackchan_tts.h"\n', '#include "stackchan_tts.h"\n#include "stackchan_hw.h"\n')
+    s = sub1(s, '#include "stackchan_tts.h"\n', '#include "stackchan_tts.h"\n#include "stackchan_hw.h"\n#include "wifi_known.h"\n#include <stdlib.h>\n')
+    # an SSID (32) and a password (64) do not fit in 96
+    s = sub1(s, "#define COMMAND_LINE_MAX 96\n", "#define COMMAND_LINE_MAX 128\n")
+    s = sub1(s, "bool sdk_token_console_command(const char *line) {\n", WIFI_CONSOLE + "bool sdk_token_console_command(const char *line) {\n")
     return sub1(s, "    if (stackchan_tts_console_command(line)) return true;\n",
-                "    if (stackchan_tts_console_command(line)) return true;\n    if (stackchan_hw_console_command(line)) return true;\n")
+                "    if (stackchan_tts_console_command(line)) return true;\n    if (stackchan_hw_console_command(line)) return true;\n"
+                "    if (wifi_console_command(line)) return true;\n")
 
 
 def muse_cmake(s):

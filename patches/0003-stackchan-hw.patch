@@ -69,7 +69,18 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  #include "button.h"
  #include "tunnel_netif.h"
  #include "net_discovery.h"
-@@ -1941,6 +1942,71 @@
+@@ -113,7 +114,9 @@
+ #define WIFI_JOIN_TRIES         3       // saved networks tried per join
+ #define WIFI_JOIN_TRY_MIN_MS    8000    // each one's share of the timeout, at least
+ #define WIFI_JOIN_SCAN_MAX      40      // as many networks as a scan reports
+-#define WIFI_QUICK_MIN_RSSI     (-75)   // near enough to join without a full scan
++#define WIFI_QUICK_MIN_RSSI     (-65)   // near enough to join without a full scan
++                                        // stackchan-muse: was -75, which took a weak last-joined
++                                        // network over a strong one; a full scan picks the strongest
+ #define MAX_SCAN_RESULTS        25
+ #define TOKEN_BUF_BYTES         2048
+ #define VM_AUTH_REFRESH_RETRY_INTERVAL_US (60LL * 1000000LL)
+@@ -1941,6 +1944,71 @@
  
  #endif  // CONFIG_HOMEHUB_BLE_COMMANDS
  
@@ -141,7 +152,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  static cJSON *on_ws_command(
      const char *command, cJSON *params, const char *request_id,
      noise_ctrl_session_generation_t session_generation) {
-@@ -1949,6 +2015,9 @@
+@@ -1949,6 +2017,9 @@
          return ble_commands_handle(command, params, request_id, session_generation);
      }
  #endif
@@ -151,7 +162,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
      if (strcmp(command, "device.list_vms") == 0) {
          return list_vms_command();
      }
-@@ -2858,6 +2927,7 @@
+@@ -2858,6 +2929,7 @@
  #if CONFIG_HOMEHUB_VOICE
      voice_init();
  #endif
@@ -162,19 +173,80 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
 diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
 --- a/esp32/main/sdk_token_console.c
 +++ b/esp32/main/sdk_token_console.c
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,9 @@
  
  #include "identity.h"
  #include "stackchan_tts.h"
 +#include "stackchan_hw.h"
++#include "wifi_known.h"
++#include <stdlib.h>
  
  // The chip's own USB port, where it has one and the log goes to it.
  #define USJ_CONSOLE (SOC_USB_SERIAL_JTAG_SUPPORTED && \
-@@ -46,6 +47,7 @@
+@@ -42,10 +45,65 @@
+ 
+ #define COMMAND "sdk_token="
+ // A command line: '>', the command and a token, with room to spare.
+-#define COMMAND_LINE_MAX 96
++#define COMMAND_LINE_MAX 128
++
++/* stackchan-muse: Wi-Fi from a PC over the serial console, for when the phone can't.
++ *   >wifi=SSID,PASSWORD   save it first among the saved networks and restart to join it
++ *   >wifi_forget=SSID     forget a saved network
++ *   >wifi_list            the saved networks, in the order they are tried (no passwords)
++ * The SSID ends at the first comma; the password is the rest of the line. */
++static bool wifi_console_command(const char *line) {
++    if (!strcmp(line, "wifi_list")) {
++        wifi_known_list_t *list = malloc(sizeof(*list));
++        if (!list) {
++            printf("@wifi_list error no memory\n");
++        } else {
++            int n = wifi_known_load(list);
++            printf("@wifi_list %d:", n);
++            for (int i = 0; i < n; i++) printf(" [%d] %s%s", i + 1, list->nets[i].ssid, list->nets[i].hidden ? " (hidden)" : "");
++            printf("\n");
++            wifi_known_wipe(list);
++            free(list);
++        }
++        fflush(stdout);
++        return true;
++    }
++    if (!strncmp(line, "wifi_forget=", 12)) {
++        bool ok = wifi_known_forget(line + 12);
++        printf(ok ? "@wifi_forget ok %s\n" : "@wifi_forget error %s\n", line + 12);
++        fflush(stdout);
++        return true;
++    }
++    if (strncmp(line, "wifi=", 5) != 0) return false;
++    const char *ssid = line + 5;
++    const char *comma = strchr(ssid, ',');
++    size_t ssid_len = comma ? (size_t)(comma - ssid) : 0;
++    const char *pass = comma ? comma + 1 : "";
++    if (!comma || ssid_len == 0 || ssid_len > WIFI_KNOWN_SSID_MAX || strlen(pass) > WIFI_KNOWN_PASS_MAX) {
++        printf("@wifi error usage: >wifi=SSID,PASSWORD\n");
++        fflush(stdout);
++        return true;
++    }
++    char name[WIFI_KNOWN_SSID_MAX + 1];
++    memcpy(name, ssid, ssid_len);
++    name[ssid_len] = '\0';
++    if (!wifi_known_remember(name, pass, -1)) {
++        printf("@wifi error could not save\n");
++        fflush(stdout);
++        return true;
++    }
++    ESP_LOGI(TAG, "saved wifi network %s first; restarting to join it", name);
++    printf("@wifi ok %s (restarting)\n", name);
++    fflush(stdout);
++    vTaskDelay(pdMS_TO_TICKS(300));
++    esp_restart();
++    return true;
++}
  
  bool sdk_token_console_command(const char *line) {
      if (stackchan_tts_console_command(line)) return true;
 +    if (stackchan_hw_console_command(line)) return true;
++    if (wifi_console_command(line)) return true;
      if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
      const char *token = line + strlen(COMMAND);
      if (!identity_sdk_token_valid(token)) {

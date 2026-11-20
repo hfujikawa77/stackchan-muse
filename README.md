@@ -99,6 +99,18 @@ Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`
 - サーボの電源は PY32 のピン0（VM EN）、LED のデータ線は PY32 のピン13
 - LED は CoreS3 から本体への 5V（AW9523 の BUS_EN・BOOST_EN）で光る。esp-bsp がこの2ビットを消すので、ドライバが 300ms ごとに立て直している
 
+## Wi-Fi を PC から設定する
+スマホから設定できないときは、USB シリアルから設定できる（パスワードは画面・チャットに残さない）:
+```powershell
+python -c "import serial,getpass,time; ss=input('ssid: '); pw=getpass.getpass('password: '); s=serial.Serial('COM7',115200); time.sleep(3); s.write(('>wifi='+ss+','+pw+'
+').encode()); time.sleep(2); print(s.read(s.in_waiting).decode(errors='replace'))"
+```
+`@wifi ok <SSID> (restarting)` で保存され、そのネットワークが先頭になって再起動する。`>wifi_list` で保存済みの一覧（試す順）、`>wifi_forget=SSID` で削除。SSID は最初の `,` まで。
+- 起動時、最後につないだネットワークは電波が -65 dBm 以上のときだけスキャンなしで再接続し、それより弱ければスキャンして電波の強い保存済みネットワークを選ぶ（SDK は -75。弱い家の Wi-Fi が強いテザリングより選ばれていた）
+
+## 日本語の表示
+`sdkconfig.stackchan` で `CONFIG_MUSE_CJK_FONT=y`（GNU Unifont、フラッシュ約 1.2 MB）。無効だと返事の日本語が □ になる。`tools/build.sh` は、`sdkconfig.stackchan` に書いた項目をビルドディレクトリの古い sdkconfig から消してから作るので、項目を足せばそのまま反映される。
+
 ## トラブルシュート
 ### Wi-Fi に繋がらない
 シリアルログ（115200 bps）の `link.wifi` を見る。ハートビートが `wifi=down` のままなら未接続。
