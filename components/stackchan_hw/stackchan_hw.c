@@ -47,6 +47,8 @@ extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 #define SCSCL_TORQUE_ENABLE   40
 #define SCSCL_GOAL_POSITION_L 42
 #define SCSCL_PRESENT_POSITION_L 56
+#define SCSCL_MIN_ANGLE_LIMIT_L  9    // min/max angle limits 0/0 = wheel (continuous) mode
+#define SCSCL_GOAL_TIME_L        44   // in wheel mode: speed, bit 10 = direction
 #define SCS_INST_READ    0x02
 
 // ---- CoreS3 AW9523 (0x58): 5 V out to the Stack-chan body ------------------
@@ -225,6 +227,7 @@ static void spring_step(spring_t *sp, float dt) {
 // keeps its zero positions. The rest of the code works in calibrated angles; only
 // servo_send() and scs_read_deg() see the servo's own.
 static float s_off_x, s_off_y;
+static volatile bool s_spin_x;   // X is in wheel mode: no position writes (they would set its speed)
 
 static void calib_load(void) {
     nvs_handle_t h;
@@ -262,8 +265,29 @@ static void servo_send(float x, float y) {
     uint8_t dx[6] = {(uint8_t)(px >> 8), (uint8_t)px, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
     uint8_t dy[6] = {(uint8_t)(py >> 8), (uint8_t)py, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dx, sizeof(dx), true);
+    if (!s_spin_x) scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dx, sizeof(dx), true);
     scs_send(SCS_ID_Y, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dy, sizeof(dy), true);
+    xSemaphoreGive(s_lock);
+}
+
+// X in wheel mode turning at `speed` (0..1000, negative the other way), or back to positions.
+// As HermesLLM's turnXBegin/turnXEnd and the official firmware's rotate(): the angle limits
+// 0/0 make an SCS0009 turn continuously, and its goal-time register then sets the speed.
+static void spin_x(bool on, int speed) {
+    uint8_t lim[4] = {0, 0, 0, 0};
+    if (!on) {
+        lim[1] = 0x14;   // limits 20..1023: position mode again
+        lim[2] = 0x03;
+        lim[3] = 0xFF;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (on) s_spin_x = true;
+    scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_MIN_ANGLE_LIMIT_L, lim, sizeof(lim), true);
+    int v = speed < 0 ? ((-speed) | (1 << 10)) : speed;
+    if (!on) v = 0;
+    uint8_t sp[2] = {(uint8_t)(v >> 8), (uint8_t)v};
+    scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_GOAL_TIME_L, sp, sizeof(sp), true);
+    if (!on) s_spin_x = false;
     xSemaphoreGive(s_lock);
 }
 
@@ -364,6 +388,17 @@ static volatile bool s_pet_on = true;
 static volatile uint8_t s_touch_raw;   // last OUTPUT1, for >touch
 static void (*volatile s_pet_cb)(void);   // the face's happy reaction (muse_state_make_happy)
 #define PET_FACE_EVERY_MS   1000   // the face stays happy 1.6 s per call: renew it while happy
+// Joy: +1 a stroke, cooling 0.5 a second. 1-2: look up; 3-5: wag the head; 6+: a full turn.
+#define JOY_MAX             10.0f
+#define JOY_COOL_PER_S      0.5f
+#define JOY_WAG             2.5f    // 3 strokes, allowing for cooling between them
+#define JOY_SPIN            5.5f    // 6 strokes
+#define WAG_MS              1200    // a wag lasts this long
+#define WAG_STEP_MS         220
+#define WAG_DEG             8
+#define SPIN_SPEED          500     // as HermesLLM: 500 for 2 s is about one turn
+#define SPIN_MS             2000
+static volatile int s_fake_strokes;   // >stroke=N: as if stroked N times
 
 typedef enum { G_NONE, G_PRESS, G_RELEASE, G_SWIPE_FWD, G_SWIPE_BACK } gesture_t;
 
@@ -604,6 +639,10 @@ static void hw_task(void *arg) {
     int dir = 1;
     // pet reaction state
     uint32_t touch_tick = 0, pet_restore_at = 0, pet_face_at = 0;
+    float joy = 0;
+    bool spinning = false, spun = false;
+    uint32_t spin_end = 0, wag_until = 0, wag_next = 0;
+    int wag_dir = 1;
     bool happy = false, wait_restore = false;
     int pet_x = STACKCHAN_SERVO_X_CENTER, pet_y = STACKCHAN_SERVO_Y_CENTER;
     bool speaking = false;
@@ -637,6 +676,15 @@ static void hw_task(void *arg) {
             touch_tick = 0;
             uint8_t level[3];
             gesture_t g = si12t_read(level) ? touch_update(level) : G_NONE;
+            bool fake_stroke = false;
+            if (g == G_NONE && s_fake_strokes > 0) {   // >stroke=N, one per poll
+                fake_stroke = true;
+                s_fake_strokes--;
+                g = G_SWIPE_FWD;
+                if (s_fake_strokes == 0) {   // and then as if the hand left
+                    pet_restore_at = now + PET_RESTORE_MS;
+                }
+            }
             if (g == G_SWIPE_FWD || g == G_SWIPE_BACK) {
                 ESP_LOGI(TAG, "head: stroke %s", g == G_SWIPE_FWD ? "forward" : "backward");
                 if (s_pet_on && !speaking) {
@@ -645,13 +693,31 @@ static void hw_task(void *arg) {
                         stackchan_servo_position(&pet_x, &pet_y);
                     }
                     wait_restore = false;   // still being stroked
+                    if (!fake_stroke) pet_restore_at = 0;   // a hand is on the head: no going back yet
                     if (s_pet_cb) s_pet_cb();   // hop, blush and hearts on the face
                     pet_face_at = now + PET_FACE_EVERY_MS;
+                    joy = joy + 1.0f > JOY_MAX ? JOY_MAX : joy + 1.0f;
+                    ESP_LOGI(TAG, "head: joy %.1f", joy);
                     bool moving;
                     taskENTER_CRITICAL(&s_spring_mux);
                     moving = s_spx.active || s_spy.active;
                     taskEXIT_CRITICAL(&s_spring_mux);
-                    if (s_servo_ready && !moving) {
+                    if (s_servo_ready && joy >= JOY_SPIN && !spun && !spinning) {
+                        // Overjoyed: a full turn of the head, once per happy spell.
+                        spun = true;
+                        spinning = true;
+                        spin_end = now + SPIN_MS;
+                        wag_until = 0;
+                        spin_x(true, SPIN_SPEED);
+                        ESP_LOGI(TAG, "head: overjoyed, spinning");
+                    } else if (s_servo_ready && joy >= JOY_WAG && !spinning) {
+                        // Happy: wag the head side to side, like a tail.
+                        if ((int32_t)(now - wag_until) >= 0) {
+                            wag_next = now;
+                            wag_dir = 1;
+                        }
+                        wag_until = now + WAG_MS;
+                    } else if (s_servo_ready && !moving && !spinning) {
                         // Y smaller = looking up. Soft limits keep it within 20 deg up.
                         int tx = pet_x, ty = pet_y;
                         switch (rand_between(0, 2)) {
@@ -682,13 +748,40 @@ static void hw_task(void *arg) {
                 ESP_LOGI(TAG, "head: touch");
             }
         }
+        joy -= JOY_COOL_PER_S * ANIM_TICK_MS / 1000.0f;
+        if (joy < 0) joy = 0;
+        if (spinning && (int32_t)(now - spin_end) >= 0) {
+            spin_x(false, 0);
+            spinning = false;
+            vTaskDelay(pdMS_TO_TICKS(30));
+            motion_teleport_to_present();   // springs from where the turn left the head
+            spring_aim(&s_spx, (float)pet_x, 800);
+            ESP_LOGI(TAG, "head: spin done");
+        }
+        if (!spinning && happy && (int32_t)(now - wag_until) < 0 && (int32_t)(now - wag_next) >= 0) {
+            spring_aim(&s_spx, clampf((float)(pet_x + wag_dir * WAG_DEG), STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX),
+                       WAG_STEP_MS);
+            wag_dir = -wag_dir;
+            wag_next = now + WAG_STEP_MS;
+            if ((int32_t)(wag_until - wag_next) <= 0) {   // last step: back to centre
+                spring_aim(&s_spx, (float)pet_x, WAG_STEP_MS);
+            }
+        }
+        if (spinning && pet_restore_at != 0) pet_restore_at = now + PET_RESTORE_MS;   // go back only after the turn
         if (happy && s_pet_cb && (int32_t)(now - pet_face_at) >= 0) {
             s_pet_cb();
             pet_face_at = now + PET_FACE_EVERY_MS;
         }
-        if (happy && wait_restore && (int32_t)(now - pet_restore_at) >= 0) {
+        if (happy && !wait_restore && s_fake_strokes == 0 && (int32_t)(now - pet_restore_at) >= 0 &&
+            pet_restore_at != 0) {
+            wait_restore = true;   // fake strokes: no real release comes
+        }
+        if (happy && wait_restore && !spinning && (int32_t)(now - pet_restore_at) >= 0) {
             happy = false;
             wait_restore = false;
+            spun = false;
+            wag_until = 0;
+            pet_restore_at = 0;
             if (s_servo_ready) {
                 spring_aim(&s_spx, (float)pet_x, 900);
                 spring_aim(&s_spy, (float)pet_y, 900);
@@ -761,9 +854,19 @@ static void hw_task(void *arg) {
             break;
         }
         case L_PET:
-            if (changed) {
+            if (spinning || joy >= JOY_SPIN) {   // overjoyed: rainbow
+                fx_t r = {.fx = STACKCHAN_FX_RAINBOW, .speed = 8};
+                render_fx(&r, now);
+                frame_send();
+            } else if (joy >= JOY_WAG) {        // happy: pink breathing
+                fx_t b = {.fx = STACKCHAN_FX_BREATH, .r = PET_R, .g = PET_G, .b = PET_B, .speed = 8};
+                render_fx(&b, now);
+                frame_send();
+                shown = -2;
+            } else if (changed || shown == -2) {
                 frame_fill(PET_R, PET_G, PET_B);
                 frame_send();
+                shown = -1;
             }
             break;
         case L_UI: {      // listening: blue breath; thinking: yellow dots going round (as HermesLLM)
@@ -1081,6 +1184,10 @@ bool stackchan_hw_console_command(const char *line) {
     } else if (!strcmp(line, "touch")) {   // debug: the last head-touch reading
         uint8_t v = s_touch_raw;
         printf("@touch ready=%d raw=0x%02X front=%u mid=%u back=%u\n", s_touch_ready, v, v & 3, (v >> 2) & 3, (v >> 4) & 3);
+    } else if (!strncmp(line, "stroke=", 7)) {   // >stroke=N  as if the head were stroked N times
+        a = atoi(line + 7);
+        s_fake_strokes = a < 1 ? 1 : (a > 10 ? 10 : a);
+        printf("@stroke %d\n", s_fake_strokes);
     } else if (!strncmp(line, "pet=", 4)) {
         s_pet_on = line[4] == '1';
         printf("@pet %s\n", s_pet_on ? "on" : "off");
