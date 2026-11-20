@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -330,6 +331,107 @@ static bool bus_5v_assert(void) {
     return changed;
 }
 
+// ---- head touch (Si12T, I2C 0x68) and the pet reaction ---------------------------
+// As the official StackChan firmware does it (hal_head_touch.cpp, modifiers/head_pet.h):
+// three pads give 0..3 each; their weighted centre is a position from -100 (front) to
+// +100 (back). Touch, then a move of the position past SWIPE_THRESHOLD, is a stroke. A
+// stroke makes the robot happy (pink LEDs) and it looks up or tilts its head; RESTORE_MS
+// after the hand leaves, LEDs and head go back.
+#define SI12T_ADDR          0x68
+#define SI12T_SENS1         0x02   // .. 0x06
+#define SI12T_CTRL1         0x08
+#define SI12T_CTRL2         0x09
+#define SI12T_REF_RST1      0x0A
+#define SI12T_REF_RST2      0x0B
+#define SI12T_CH_HOLD1      0x0C
+#define SI12T_CH_HOLD2      0x0D
+#define SI12T_CAL_HOLD1     0x0E
+#define SI12T_CAL_HOLD2     0x0F
+#define SI12T_OUTPUT1       0x10
+#define SI12T_SENS_LOW_3    0x33   // official: SI12T_TYPE_LOW, SI12T_SENSITIVITY_LEVEL_3
+#define TOUCH_EVERY_TICKS   3      // ~60 ms (official 50 ms)
+#define SWIPE_THRESHOLD     40
+#define PET_RESTORE_MS      3000
+#define PET_R 255
+#define PET_G 60
+#define PET_B 140
+
+static i2c_master_dev_handle_t s_si12t;
+static bool s_touch_ready;
+static volatile bool s_pet_on = true;
+static volatile uint8_t s_touch_raw;   // last OUTPUT1, for >touch
+
+typedef enum { G_NONE, G_PRESS, G_RELEASE, G_SWIPE_FWD, G_SWIPE_BACK } gesture_t;
+
+static esp_err_t si12t_w(uint8_t reg, uint8_t v) {
+    uint8_t b[2] = {reg, v};
+    return i2c_master_transmit(s_si12t, b, 2, 100);
+}
+
+static esp_err_t si12t_setup(i2c_master_bus_handle_t bus) {
+    i2c_device_config_t dc = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = SI12T_ADDR, .scl_speed_hz = 100000};
+    esp_err_t err = i2c_master_bus_add_device(bus, &dc, &s_si12t);
+    if (err != ESP_OK) return err;
+    // enable channels and reference calibration
+    const uint8_t zero_regs[] = {SI12T_REF_RST1, SI12T_REF_RST2, SI12T_CH_HOLD1, SI12T_CH_HOLD2, SI12T_CAL_HOLD1, SI12T_CAL_HOLD2};
+    for (size_t i = 0; i < sizeof(zero_regs) && err == ESP_OK; i++) err = si12t_w(zero_regs[i], 0x00);
+    // soft reset, then auto mode, FTC=01, interrupt middle/high, response 4
+    if (err == ESP_OK) err = si12t_w(SI12T_CTRL2, 0x0F);
+    if (err == ESP_OK) err = si12t_w(SI12T_CTRL2, 0x07);
+    if (err == ESP_OK) err = si12t_w(SI12T_CTRL1, 0x22);
+    for (uint8_t r = SI12T_SENS1; r < SI12T_SENS1 + 5 && err == ESP_OK; r++) err = si12t_w(r, SI12T_SENS_LOW_3);
+    return err;
+}
+
+static bool si12t_read(uint8_t level[3]) {
+    uint8_t reg = SI12T_OUTPUT1, v = 0;
+    if (i2c_master_transmit_receive(s_si12t, &reg, 1, &v, 1, 100) != ESP_OK) return false;
+    s_touch_raw = v;
+    for (int i = 0; i < 3; i++) level[i] = (v >> (2 * i)) & 0x03;
+    return true;
+}
+
+// The official recogniser: IDLE -> TOUCHED (press) -> SWIPING (stroke) -> IDLE (release).
+static gesture_t touch_update(const uint8_t level[3]) {
+    static enum { T_IDLE, T_TOUCHED, T_SWIPING } st = T_IDLE;
+    static int start_pos;
+    int total = level[0] + level[1] + level[2];
+    bool touched = level[0] >= 1 || level[1] >= 1 || level[2] >= 1;
+    int pos = total ? (level[0] * -100 + level[2] * 100) / total : 0;
+    switch (st) {
+    case T_IDLE:
+        if (touched) {
+            st = T_TOUCHED;
+            start_pos = pos;
+            return G_PRESS;
+        }
+        break;
+    case T_TOUCHED:
+        if (!touched) {
+            st = T_IDLE;
+            return G_RELEASE;
+        }
+        if (pos - start_pos > SWIPE_THRESHOLD) {
+            st = T_SWIPING;
+            return G_SWIPE_FWD;
+        }
+        if (pos - start_pos < -SWIPE_THRESHOLD) {
+            st = T_SWIPING;
+            return G_SWIPE_BACK;
+        }
+        break;
+    case T_SWIPING:
+        if (!touched) {
+            st = T_IDLE;
+            return G_RELEASE;
+        }
+        break;
+    }
+    return G_NONE;
+}
+
+static int rand_between(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
+
 static void led_fill_buffer(uint8_t r, uint8_t g, uint8_t b) {
     for (uint8_t i = 0; i < STACKCHAN_LED_COUNT; i++) stackchan_led_set(i, r, g, b);
 }
@@ -339,6 +441,11 @@ static void hw_task(void *arg) {
     (void)arg;
     uint32_t guard_ms = 0, speak_start = 0, sway_next = 0, probe_ms = 0, led_tick = 0;
     int dir = 1;
+    // pet reaction state
+    uint32_t touch_tick = 0, pet_restore_at = 0;
+    bool happy = false, wait_restore = false;
+    uint8_t pet_saved_led[sizeof(s_led_ram)];
+    int pet_x = STACKCHAN_SERVO_X_CENTER, pet_y = STACKCHAN_SERVO_Y_CENTER;
     bool speaking = false;
     uint8_t saved_led[sizeof(s_led_ram)];
     int saved_x = STACKCHAN_SERVO_X_CENTER, saved_y = STACKCHAN_SERVO_Y_CENTER;
@@ -362,6 +469,75 @@ static void hw_task(void *arg) {
             if (bus_5v_assert() && s_led_ready) {
                 vTaskDelay(pdMS_TO_TICKS(20));   // LEDs lose their colour without power: send it again
                 stackchan_led_show();
+            }
+        }
+
+        if (s_touch_ready && ++touch_tick >= TOUCH_EVERY_TICKS) {
+            touch_tick = 0;
+            uint8_t level[3];
+            gesture_t g = si12t_read(level) ? touch_update(level) : G_NONE;
+            if (g == G_SWIPE_FWD || g == G_SWIPE_BACK) {
+                ESP_LOGI(TAG, "head: stroke %s", g == G_SWIPE_FWD ? "forward" : "backward");
+                if (s_pet_on && !speaking) {
+                    if (!happy) {   // remember how things were, to go back to
+                        happy = true;
+                        xSemaphoreTake(s_lock, portMAX_DELAY);
+                        memcpy(pet_saved_led, s_led_ram, sizeof(pet_saved_led));
+                        xSemaphoreGive(s_lock);
+                        stackchan_servo_position(&pet_x, &pet_y);
+                    }
+                    wait_restore = false;   // still being stroked
+                    if (s_led_ready) {
+                        led_fill_buffer(PET_R, PET_G, PET_B);
+                        stackchan_led_show();
+                    }
+                    bool moving;
+                    taskENTER_CRITICAL(&s_spring_mux);
+                    moving = s_spx.active || s_spy.active;
+                    taskEXIT_CRITICAL(&s_spring_mux);
+                    if (s_servo_ready && !moving) {
+                        // Y smaller = looking up. Soft limits keep it within 20 deg up.
+                        int tx = pet_x, ty = pet_y;
+                        switch (rand_between(0, 2)) {
+                        case 0:   // look up
+                            ty -= rand_between(15, 25);
+                            tx += rand_between(-5, 5);
+                            break;
+                        case 1:   // tilt to one side
+                            ty += rand_between(0, 5);
+                            tx += rand_between(0, 1) ? 15 : -15;
+                            break;
+                        default:  // big happy look up
+                            ty -= rand_between(25, 40);
+                            break;
+                        }
+                        uint32_t ms = (uint32_t)rand_between(400, 600);
+                        spring_aim(&s_spx, clampf((float)tx, STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX), ms);
+                        spring_aim(&s_spy, clampf((float)ty, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX), ms);
+                    }
+                }
+            } else if (g == G_RELEASE) {
+                ESP_LOGI(TAG, "head: release");
+                if (happy) {
+                    wait_restore = true;
+                    pet_restore_at = now + PET_RESTORE_MS;
+                }
+            } else if (g == G_PRESS) {
+                ESP_LOGI(TAG, "head: touch");
+            }
+        }
+        if (happy && wait_restore && (int32_t)(now - pet_restore_at) >= 0) {
+            happy = false;
+            wait_restore = false;
+            if (s_led_ready) {
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                memcpy(s_led_ram, pet_saved_led, sizeof(pet_saved_led));
+                xSemaphoreGive(s_lock);
+                stackchan_led_show();
+            }
+            if (s_servo_ready) {
+                spring_aim(&s_spx, (float)pet_x, 900);
+                spring_aim(&s_spy, (float)pet_y, 900);
             }
         }
 
@@ -508,6 +684,12 @@ esp_err_t stackchan_hw_init(void) {
         ESP_LOGE(TAG, "servo UART setup failed");
         return ESP_OK;   // LEDs still work
     }
+    if (si12t_setup(bus) == ESP_OK) {
+        s_touch_ready = true;
+        ESP_LOGI(TAG, "head touch ready");
+    } else {
+        ESP_LOGW(TAG, "head touch (Si12T) not found");
+    }
     calib_load();
     s_uart_ok = true;
     int tries = 0;
@@ -643,6 +825,12 @@ bool stackchan_hw_console_command(const char *line) {
         s_fake_voice_until = now_ms() + (uint32_t)a * 1000;
         s_fake_voice = true;
         printf("@swaytest %d s\n", a);
+    } else if (!strcmp(line, "touch")) {   // debug: the last head-touch reading
+        uint8_t v = s_touch_raw;
+        printf("@touch ready=%d raw=0x%02X front=%u mid=%u back=%u\n", s_touch_ready, v, v & 3, (v >> 2) & 3, (v >> 4) & 3);
+    } else if (!strncmp(line, "pet=", 4)) {
+        s_pet_on = line[4] == '1';
+        printf("@pet %s\n", s_pet_on ? "on" : "off");
     } else if (!strncmp(line, "anim=", 5)) {
         stackchan_hw_set_speech_anim(line[5] == '1');
         printf("@anim %s\n", line[5] == '1' ? "on" : "off");
