@@ -869,6 +869,19 @@ bool stackchan_hw_console_command(const char *line) {
             fflush(stdout);
             return true;
         }
+        float tdx, tdy;
+        if (sscanf(v, "trim=%f,%f", &tdx, &tdy) == 2 && fabsf(tdx) <= 30 && fabsf(tdy) <= 30) {
+            // >servo=trim=DX,DY: move the centre by exactly DX/DY degrees (Y smaller = up), without
+            // reading the servos, whose resting position wanders by a degree or two.
+            s_off_x += tdx;
+            s_off_y += tdy;
+            err = calib_save();
+            if (s_servo_ready) motion_teleport_to_present();
+            printf("@servo trim %s: offset x%+.1f y%+.1f deg\n", err == ESP_OK ? "saved" : esp_err_to_name(err),
+                   s_off_x, s_off_y);
+            fflush(stdout);
+            return true;
+        }
         if (!strcmp(v, "zero") || !strcmp(v, "zero_reset")) {
             // >servo=zero: where the head is now becomes the centre (turn the torque off and
             // set it by hand first). >servo=zero_reset forgets the calibration.

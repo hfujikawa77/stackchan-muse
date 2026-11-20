@@ -83,6 +83,7 @@ Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`
 | `>swaytest=SEC` | 話しかけずに、首振りを SEC 秒だけ動かす（調整用） |
 | `>pet=0` / `1` | ナデナデの反応を止める / 戻す |
 | `>servo=off` → 手で正面に合わせる → `>servo=zero` → `>servo=on` | 正面（X 150, Y 90）の校正。NVS に保存。`>servo=zero_reset` で消す |
+| `>servo=trim=DX,DY` | 正面を DX/DY 度だけずらして保存（Y はマイナスで上向き） |
 | `>servo=pos` / `>touch` | デバッグ用。サーボの実位置とばねの状態 / 頭タッチの生の値 |
 | `>py32r=REG[,LEN]` / `>i2cr=ADDR,REG[,LEN]` | デバッグ用のレジスタ読み出し |
 
