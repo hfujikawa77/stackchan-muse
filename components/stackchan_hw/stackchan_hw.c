@@ -43,6 +43,8 @@ extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 #define SCS_INST_WRITE   0x03
 #define SCSCL_TORQUE_ENABLE   40
 #define SCSCL_GOAL_POSITION_L 42
+#define SCSCL_PRESENT_POSITION_L 56
+#define SCS_INST_READ    0x02
 
 // ---- CoreS3 AW9523 (0x58): 5 V out to the Stack-chan body ------------------
 // BUS_EN (P0 bit 1) and BOOST_EN (P1 bit 7) feed 5 V to the body, which the LEDs need
@@ -61,6 +63,7 @@ static i2c_master_dev_handle_t s_aw9523;
 static SemaphoreHandle_t s_lock;
 static bool s_led_ready;
 static bool s_servo_ready;
+static bool s_uart_ok;          // servo UART is set up; servos may still be booting
 static bool s_inited;
 static uint8_t s_led_ram[STACKCHAN_LED_COUNT * 2];
 static int s_x = STACKCHAN_SERVO_X_CENTER;
@@ -71,14 +74,13 @@ static int s_y = STACKCHAN_SERVO_Y_CENTER;
 // VOICE_START_MS counts as speech (so a 90 ms UI chirp does not), and speech ends after
 // VOICE_HOLD_MS of quiet. While speaking the LEDs follow the level and the head sways a
 // little; afterwards both go back to how they were.
-#define ANIM_TICK_MS     50
+#define ANIM_TICK_MS     20      // 50 Hz, as the official StackChan firmware drives its servos
+#define LED_EVERY_TICKS  3       // LEDs at ~16 Hz: the I2C bus is shared with the codec
 #define VOICE_LEVEL_MIN  0.08f
 #define VOICE_START_MS   300
 #define VOICE_HOLD_MS    1500   // quiet this long ends speech; shorter pauses between sentences do not
-#define SWAY_DEG         8.0f    // amplitude either side of where the head was
-#define SWAY_PERIOD_S    1.8f    // one full left-right-left
-#define SWAY_RAMP_S      0.6f    // amplitude grows over this, so the start is gentle
-#define SWAY_STEP_MS     100     // each 50 ms step is given 100 ms, so moves overlap smoothly
+#define SWAY_DEG         8.0f    // either side of where the head was
+#define SWAY_HALF_MS     900     // each swing; the spring is tuned to arrive in about this long
 #define SPEAK_R 255
 #define SPEAK_G 120
 #define SPEAK_B 60
@@ -149,39 +151,128 @@ static bool scs_ping(uint8_t id) {
     return false;
 }
 
-static uint16_t scs_pos(int deg) {
-    if (deg < 0) deg = 0;
-    if (deg > 300) deg = 300;
-    return (uint16_t)(1023 - (deg * 1023 + 150) / 300);   // same mapping as HermesLLM (inverted)
-}
-
-static void scs_write_pos(uint8_t id, int deg, uint32_t ms) {
-    uint16_t pos = scs_pos(deg);
-    if (ms > 0xFFFF) ms = 0xFFFF;
-    // SCSCL is big endian: position, time, speed (0 = use time)
-    uint8_t d[6] = {(uint8_t)(pos >> 8), (uint8_t)pos, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
-    scs_send(id, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, d, sizeof(d), true);
-}
-
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Pings both servos; on success marks them ready. Servos switched on a moment ago can take
+// a while to answer, and some boots they miss the first ping, so callers retry.
+static void motion_teleport_to_present(void);
+
+static bool servo_probe(void) {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool x_ok = scs_ping(SCS_ID_X), y_ok = scs_ping(SCS_ID_Y);
+    xSemaphoreGive(s_lock);
+    if (x_ok && y_ok && !s_servo_ready) {
+        s_servo_ready = true;
+        motion_teleport_to_present();
+    }
+    return s_servo_ready;
+}
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// For animation: small steps sent often, in fractions of a degree, with no minimum time.
-static void servo_track(float x, float y, uint32_t ms) {
-    if (!s_servo_ready) return;
-    x = clampf(x, STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX);
-    y = clampf(y, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX);
+// ---- motion: a spring per axis, stepped at 50 Hz -----------------------------------
+// The way the official StackChan firmware moves its servos (stackchan/motion/servo.cpp):
+// the target only sets where a mass-spring-damper is pulled, the ESP32 steps the spring
+// every 20 ms, and each step goes to the servo as a 20 ms move. The servo's own timed
+// moves are never relied on, so there is nothing for it to stop and restart.
+typedef struct {
+    float pos, vel, target;
+    float k, c;        // stiffness and damping (unit mass)
+    bool active;
+} spring_t;
+
+static spring_t s_spx = {STACKCHAN_SERVO_X_CENTER, 0, STACKCHAN_SERVO_X_CENTER, 170, 26, false};
+static spring_t s_spy = {STACKCHAN_SERVO_Y_CENTER, 0, STACKCHAN_SERVO_Y_CENTER, 170, 26, false};
+static portMUX_TYPE s_spring_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Critically damped, tuned so a move settles in about `ms` (to ~2 % at 5.8 / omega).
+static void spring_aim(spring_t *sp, float target, uint32_t ms) {
+    float w = 5800.0f / (float)(ms ? ms : 1);
+    w = clampf(w, 4.0f, 40.0f);
+    taskENTER_CRITICAL(&s_spring_mux);
+    sp->target = target;
+    sp->k = w * w;
+    sp->c = 2.0f * w;
+    sp->active = true;
+    taskEXIT_CRITICAL(&s_spring_mux);
+}
+
+static void spring_step(spring_t *sp, float dt) {
+    if (!sp->active) return;
+    float a = -sp->k * (sp->pos - sp->target) - sp->c * sp->vel;
+    sp->vel += a * dt;
+    sp->pos += sp->vel * dt;
+    if (fabsf(sp->pos - sp->target) < 0.05f && fabsf(sp->vel) < 0.5f) {
+        sp->pos = sp->target;
+        sp->vel = 0;
+        sp->active = false;
+    }
+}
+
+static void servo_send(float x, float y) {
+    // Soft limits apply to targets (stackchan_servo_move, the sway). Here only the servo's own
+    // range: a head that starts outside the soft limits is eased back by the spring, not snapped.
+    x = clampf(x, 0.0f, 300.0f);
+    y = clampf(y, 0.0f, 300.0f);
     uint16_t px = (uint16_t)lroundf(1023.0f - x * 1023.0f / 300.0f);
     uint16_t py = (uint16_t)lroundf(1023.0f - y * 1023.0f / 300.0f);
+    const uint16_t ms = ANIM_TICK_MS;
     uint8_t dx[6] = {(uint8_t)(px >> 8), (uint8_t)px, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
     uint8_t dy[6] = {(uint8_t)(py >> 8), (uint8_t)py, (uint8_t)(ms >> 8), (uint8_t)ms, 0, 0};
     xSemaphoreTake(s_lock, portMAX_DELAY);
     scs_send(SCS_ID_X, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dx, sizeof(dx), true);
     scs_send(SCS_ID_Y, SCS_INST_WRITE, SCSCL_GOAL_POSITION_L, dy, sizeof(dy), true);
+    xSemaphoreGive(s_lock);
+}
+
+// Steps both springs and sends the result while either is moving.
+static void motion_tick(void) {
+    spring_t x, y;
+    taskENTER_CRITICAL(&s_spring_mux);
+    bool moving = s_spx.active || s_spy.active;
+    spring_step(&s_spx, ANIM_TICK_MS / 1000.0f);
+    spring_step(&s_spy, ANIM_TICK_MS / 1000.0f);
+    x = s_spx;
+    y = s_spy;
+    taskEXIT_CRITICAL(&s_spring_mux);
+    if (moving) servo_send(x.pos, y.pos);
+}
+
+// Present position in degrees, or -1. The reply is FF FF id 04 <error> <pos hi> <pos lo> chk;
+// our own echoed request has the READ instruction (0x02) where the reply has error 0.
+static float scs_read_deg(uint8_t id) {
+    uint8_t len = 2;
+    scs_send(id, SCS_INST_READ, SCSCL_PRESENT_POSITION_L, &len, 1, true);
+    uint8_t buf[24];
+    int n = uart_read_bytes(SERVO_UART, buf, sizeof(buf), pdMS_TO_TICKS(30));
+    for (int k = 0; k + 6 < n; k++) {
+        if (buf[k] == 0xFF && buf[k + 1] == 0xFF && buf[k + 2] == id && buf[k + 3] == 4 && buf[k + 4] == 0x00) {
+            int pos = (buf[k + 5] << 8) | buf[k + 6];
+            if (pos < 0 || pos > 1023) return -1;
+            return (1023 - pos) * 300.0f / 1023.0f;
+        }
+    }
+    return -1;
+}
+
+// Start the springs where the head really is, so the first move does not snap.
+static void motion_teleport_to_present(void) {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float x = scs_read_deg(SCS_ID_X), y = scs_read_deg(SCS_ID_Y);
+    xSemaphoreGive(s_lock);
+    if (x < 0 || y < 0) {
+        ESP_LOGW(TAG, "could not read servo positions; assuming centre");
+        return;
+    }
+    taskENTER_CRITICAL(&s_spring_mux);
+    s_spx.pos = s_spx.target = x;
+    s_spy.pos = s_spy.target = y;
+    s_spx.vel = s_spy.vel = 0;
+    s_spx.active = s_spy.active = false;
+    taskEXIT_CRITICAL(&s_spring_mux);
     s_x = (int)lroundf(x);
     s_y = (int)lroundf(y);
-    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "servo position x=%.1f y=%.1f", x, y);
 }
 
 // Sets BUS_EN / BOOST_EN if either is clear. Read and write back to back, so a bit the
@@ -207,7 +298,8 @@ static void led_fill_buffer(uint8_t r, uint8_t g, uint8_t b) {
 // One task for the 5 V guard and the speech animation, to keep internal RAM down.
 static void hw_task(void *arg) {
     (void)arg;
-    uint32_t guard_ms = 0, speak_start = 0;
+    uint32_t guard_ms = 0, speak_start = 0, sway_next = 0, probe_ms = 0, led_tick = 0;
+    int dir = 1;
     bool speaking = false;
     uint8_t saved_led[sizeof(s_led_ram)];
     int saved_x = STACKCHAN_SERVO_X_CENTER, saved_y = STACKCHAN_SERVO_Y_CENTER;
@@ -219,8 +311,13 @@ static void hw_task(void *arg) {
         uint32_t now = now_ms();
         uint32_t gap = now - prev;
         prev = now;
+        if (s_servo_ready) motion_tick();
 
         guard_ms += ANIM_TICK_MS;
+        if (!s_servo_ready && s_uart_ok && (probe_ms += ANIM_TICK_MS) >= 5000) {
+            probe_ms = 0;
+            if (servo_probe()) ESP_LOGI(TAG, "servos answered late; servo commands enabled");
+        }
         if (s_aw9523 && guard_ms >= BUS_GUARD_MS) {
             guard_ms = 0;
             if (bus_5v_assert() && s_led_ready) {
@@ -230,8 +327,10 @@ static void hw_task(void *arg) {
         }
 
         uint32_t last = s_voice_last_ms, run = s_voice_run_ms;
-        bool voice = s_anim_on && s_voice_seen && (now - last) < VOICE_HOLD_MS &&
-                     (speaking || (last - run) >= VOICE_START_MS);
+        // Signed: the audio task can stamp `last` after we read `now`, and an unsigned
+        // now - last would then wrap to a huge "quiet" and end the speech mid-sentence.
+        bool voice = s_anim_on && s_voice_seen && (int32_t)(now - last) < VOICE_HOLD_MS &&
+                     (speaking || (int32_t)(last - run) >= VOICE_START_MS);
 
         if (voice && !speaking) {
             speaking = true;
@@ -242,6 +341,9 @@ static void hw_task(void *arg) {
             smooth = 0;
             shown = -1;
             speak_start = now;
+            sway_next = now;
+            dir = 1;
+            led_tick = 0;
             max_gap = 0;
             ticks = 0;
             late = 0;
@@ -254,16 +356,17 @@ static void hw_task(void *arg) {
                 stackchan_led_show();
             }
             if (s_servo_ready) stackchan_servo_move(saved_x, saved_y, 500);
-            ESP_LOGI(TAG, "speech anim: %.1f s, %u ticks, max gap %u ms, %u ticks over 80 ms",
+            ESP_LOGI(TAG, "speech anim: %.1f s, %u ticks, max gap %u ms, %u ticks over 40 ms",
                      (now - speak_start) / 1000.0f, (unsigned)ticks, (unsigned)max_gap, (unsigned)late);
             continue;
         }
         if (!speaking) continue;
         ticks++;
         if (gap > max_gap) max_gap = gap;
-        if (gap > 80) late++;
+        if (gap > 40) late++;
 
-        if (s_led_ready) {
+        if (s_led_ready && ++led_tick >= LED_EVERY_TICKS) {
+            led_tick = 0;
             float l = s_level;
             smooth = l > smooth ? 0.5f * smooth + 0.5f * l : 0.75f * smooth + 0.25f * l;   // fast up, slow down
             int br = 30 + (int)(smooth * 225.0f);
@@ -273,13 +376,11 @@ static void hw_task(void *arg) {
                 shown = br;
             }
         }
-        if (s_servo_ready) {
-            // A sine sway, sent as small steps: the servo eases through each turn instead of
-            // stopping dead at the ends.
-            float t = (now - speak_start) / 1000.0f;
-            float amp = SWAY_DEG * (t < SWAY_RAMP_S ? t / SWAY_RAMP_S : 1.0f);
-            float x = saved_x + amp * sinf(2.0f * (float)M_PI * t / SWAY_PERIOD_S);
-            servo_track(x, (float)saved_y, SWAY_STEP_MS);
+        if (s_servo_ready && (int32_t)(now - sway_next) >= 0) {
+            // Swing to the other side: only the target changes; the spring does the easing.
+            spring_aim(&s_spx, saved_x + dir * SWAY_DEG, SWAY_HALF_MS);
+            dir = -dir;
+            sway_next = now + SWAY_HALF_MS;
         }
     }
 }
@@ -325,7 +426,7 @@ esp_err_t stackchan_hw_init(void) {
     if (i2c_master_bus_add_device(bus, &aw, &s_aw9523) == ESP_OK) {
         bus_5v_assert();
         vTaskDelay(pdMS_TO_TICKS(50));
-        if (xTaskCreate(hw_task, "sc_hw", 3072, NULL, 2, NULL) != pdPASS) {
+        if (xTaskCreate(hw_task, "sc_hw", 3072, NULL, 5, NULL) != pdPASS) {
             ESP_LOGW(TAG, "hw task not started (5V guard, speech animation)");
         }
     } else {
@@ -363,10 +464,11 @@ esp_err_t stackchan_hw_init(void) {
         ESP_LOGE(TAG, "servo UART setup failed");
         return ESP_OK;   // LEDs still work
     }
-    bool x_ok = scs_ping(SCS_ID_X), y_ok = scs_ping(SCS_ID_Y);
-    ESP_LOGI(TAG, "servo ping: X=%d Y=%d", x_ok, y_ok);
-    s_servo_ready = x_ok && y_ok;
-    if (!s_servo_ready) ESP_LOGW(TAG, "servos not answering; servo commands disabled");
+    s_uart_ok = true;
+    int tries = 0;
+    while (!servo_probe() && ++tries < 12) vTaskDelay(pdMS_TO_TICKS(150));   // up to ~2 s
+    if (s_servo_ready) ESP_LOGI(TAG, "servos answered (try %d)", tries + 1);
+    else ESP_LOGW(TAG, "servos not answering yet; will keep trying every 5 s");
     return ESP_OK;
 }
 
@@ -410,12 +512,11 @@ esp_err_t stackchan_servo_move(int x_deg, int y_deg, uint32_t ms) {
     x_deg = clampi(x_deg, STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX);
     y_deg = clampi(y_deg, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX);
     if (ms < STACKCHAN_SERVO_MIN_MOVE_MS) ms = STACKCHAN_SERVO_MIN_MOVE_MS;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    scs_write_pos(SCS_ID_X, x_deg, ms);
-    scs_write_pos(SCS_ID_Y, y_deg, ms);
+    // The 50 Hz motion task takes it from here.
+    spring_aim(&s_spx, (float)x_deg, ms);
+    spring_aim(&s_spy, (float)y_deg, ms);
     s_x = x_deg;
     s_y = y_deg;
-    xSemaphoreGive(s_lock);
     return ESP_OK;
 }
 
@@ -520,7 +621,7 @@ void stackchan_hw_audio_level(float level) {
     s_level = level;
     if (level < VOICE_LEVEL_MIN) return;
     uint32_t now = now_ms();
-    if (!s_voice_seen || now - s_voice_last_ms > VOICE_HOLD_MS) s_voice_run_ms = now;
+    if (!s_voice_seen || (int32_t)(now - s_voice_last_ms) > VOICE_HOLD_MS) s_voice_run_ms = now;
     s_voice_last_ms = now;
     s_voice_seen = true;
 }
