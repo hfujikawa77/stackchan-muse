@@ -81,8 +81,8 @@ static int s_y = STACKCHAN_SERVO_Y_CENTER;
 #define VOICE_START_MS   300
 #define VOICE_HOLD_MS    1500   // quiet this long ends speech; shorter pauses between sentences do not
 // Sway defaults; >sway=DEG,HALF_MS changes them at run time for tuning.
-#define SWAY_DEG_DEFAULT      12.0f   // either side of where the head was
-#define SWAY_HALF_MS_DEFAULT  900     // each swing; the spring is tuned to arrive in about this long
+#define SWAY_DEG_DEFAULT      15.0f   // either side of where the head was
+#define SWAY_HALF_MS_DEFAULT  700     // each swing; the spring is tuned to arrive in about this long
 #define SPEAK_R 255
 #define SPEAK_G 120
 #define SPEAK_B 60

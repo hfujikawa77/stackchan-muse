@@ -79,7 +79,7 @@ Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`
 | `>servo=X,Y[,MS]` | 首を動かす。X 60〜240（150 が正面）、Y 70〜90（90 が水平）。範囲外は丸める |
 | `>servo=center` / `off` / `on` | 正面へ / トルクを切る / 入れる |
 | `>anim=0` / `1` | 発話中の LED・首振りを止める / 戻す |
-| `>sway=DEG,HALF_MS` | 首振りの振れ幅と、片道の時間を変える（既定 12°, 900ms。再起動で戻る） |
+| `>sway=DEG,HALF_MS` | 首振りの振れ幅と、片道の時間を変える（既定 15°, 700ms。再起動で戻る） |
 | `>swaytest=SEC` | 話しかけずに、首振りを SEC 秒だけ動かす（調整用） |
 | `>py32r=REG[,LEN]` / `>i2cr=ADDR,REG[,LEN]` | デバッグ用のレジスタ読み出し |
 
