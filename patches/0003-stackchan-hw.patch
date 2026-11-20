@@ -26,21 +26,29 @@ diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
  static void add_command(cJSON *commands, const char *name,
                          const char *description,
                          cJSON *required, cJSON *optional) {
-@@ -1410,6 +1417,23 @@
+@@ -1410,6 +1417,31 @@
                  "voltage, and whether it is charging or on USB power; each is "
                  "null when the device has no battery or can't measure it",
                  nullptr, nullptr);
 +    {
-+        cJSON *rgb = cJSON_CreateObject();
-+        cJSON_AddItemToObject(rgb, "r", int_param("Red, 0 to 255."));
-+        cJSON_AddItemToObject(rgb, "g", int_param("Green, 0 to 255."));
-+        cJSON_AddItemToObject(rgb, "b", int_param("Blue, 0 to 255."));
++        cJSON *led = cJSON_CreateObject();
++        cJSON_AddItemToObject(led, "r", int_param("Red, 0 to 255."));
++        cJSON_AddItemToObject(led, "g", int_param("Green, 0 to 255."));
++        cJSON_AddItemToObject(led, "b", int_param("Blue, 0 to 255."));
++        cJSON_AddItemToObject(led, "effect", string_param("rainbow, breath, blink, strobe, chase, wave, alternate, solid, or off to stop."));
++        cJSON_AddItemToObject(led, "preset", string_param("party, ocean, christmas, rainbow, calm_breath, alert_red, warm_white or cool_blue."));
++        cJSON_AddItemToObject(led, "speed", int_param("Effect speed, 1 (slow) to 10 (fast); default 5."));
++        cJSON_AddItemToObject(led, "r2", int_param("Second colour for alternate: red."));
++        cJSON_AddItemToObject(led, "g2", int_param("Second colour for alternate: green."));
++        cJSON_AddItemToObject(led, "b2", int_param("Second colour for alternate: blue."));
 +        add_command(commands, "stackchan.led",
-+                    "Light all 12 LEDs of the Stack-chan body in one colour. 0,0,0 turns them off.",
-+                    rgb, nullptr);
++                    "Light the 12 LEDs of the Stack-chan body. Give r, g, b for one steady colour "
++                    "(0,0,0 turns them off); or an effect, coloured by r, g, b (and r2, g2, b2) at a speed; "
++                    "or a preset. While it listens, thinks or speaks, those lights come first.",
++                    nullptr, led);
 +        cJSON *pose = cJSON_CreateObject();
 +        cJSON_AddItemToObject(pose, "x", int_param("Pan angle in degrees, 60 to 240; 150 is centre."));
-+        cJSON_AddItemToObject(pose, "y", int_param("Tilt angle in degrees, 70 to 90; 90 is level."));
++        cJSON_AddItemToObject(pose, "y", int_param("Tilt angle in degrees, 70 to 90; 90 is the resting position, smaller looks up."));
 +        cJSON_AddItemToObject(pose, "ms", int_param("Time to get there in milliseconds, at least 150; default 600."));
 +        add_command(commands, "stackchan.servo",
 +                    "Move the Stack-chan head. With no x and y it returns to centre. "
@@ -61,7 +69,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  #include "button.h"
  #include "tunnel_netif.h"
  #include "net_discovery.h"
-@@ -1941,6 +1942,57 @@
+@@ -1941,6 +1942,71 @@
  
  #endif  // CONFIG_HOMEHUB_BLE_COMMANDS
  
@@ -72,20 +80,34 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
 +    return cJSON_IsNumber(item) ? item->valueint : fallback;
 +}
 +
++static int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
++
 +static cJSON *stackchan_command(const char *command, cJSON *params) {
 +    if (strcmp(command, "stackchan.led") == 0) {
-+        bool r_ok, g_ok, b_ok;
-+        int r = json_int(params, "r", 0, &r_ok);
-+        int g = json_int(params, "g", 0, &g_ok);
-+        int b = json_int(params, "b", 0, &b_ok);
-+        if (!r_ok || !g_ok || !b_ok) return command_error("missing_param", "r, g and b are required");
 +        if (!stackchan_led_ready()) return command_error("unavailable", "LEDs are not available");
-+        r = r < 0 ? 0 : (r > 255 ? 255 : r);
-+        g = g < 0 ? 0 : (g > 255 ? 255 : g);
-+        b = b < 0 ? 0 : (b > 255 ? 255 : b);
-+        if (stackchan_led_fill((uint8_t)r, (uint8_t)g, (uint8_t)b) != ESP_OK) {
-+            return command_error("io_error", "LED update failed");
++        bool r_ok, g_ok, b_ok, unused;
++        int r = clamp255(json_int(params, "r", 0, &r_ok));
++        int g = clamp255(json_int(params, "g", 0, &g_ok));
++        int b = clamp255(json_int(params, "b", 0, &b_ok));
++        int r2 = clamp255(json_int(params, "r2", 0, &unused));
++        int g2 = clamp255(json_int(params, "g2", 0, &unused));
++        int b2 = clamp255(json_int(params, "b2", 0, &unused));
++        int speed = json_int(params, "speed", 0, &unused);
++        cJSON *preset = params ? cJSON_GetObjectItem(params, "preset") : NULL;
++        cJSON *effect = params ? cJSON_GetObjectItem(params, "effect") : NULL;
++        esp_err_t err;
++        if (cJSON_IsString(preset) && preset->valuestring) {
++            err = stackchan_led_preset(preset->valuestring);
++            if (err == ESP_ERR_NOT_FOUND) return command_error("bad_param", "unknown preset");
++        } else if (cJSON_IsString(effect) && effect->valuestring) {
++            err = stackchan_led_effect(effect->valuestring, (uint8_t)r, (uint8_t)g, (uint8_t)b,
++                                       (uint8_t)r2, (uint8_t)g2, (uint8_t)b2, speed);
++            if (err == ESP_ERR_NOT_FOUND) return command_error("bad_param", "unknown effect");
++        } else {
++            if (!r_ok || !g_ok || !b_ok) return command_error("missing_param", "give r, g and b, an effect or a preset");
++            err = stackchan_led_fill((uint8_t)r, (uint8_t)g, (uint8_t)b);
 +        }
++        if (err != ESP_OK) return command_error("io_error", "LED update failed");
 +        cJSON *result = cJSON_CreateObject();
 +        cJSON_AddBoolToObject(result, "ok", true);
 +        return result;
@@ -119,7 +141,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  static cJSON *on_ws_command(
      const char *command, cJSON *params, const char *request_id,
      noise_ctrl_session_generation_t session_generation) {
-@@ -1949,6 +2001,9 @@
+@@ -1949,6 +2015,9 @@
          return ble_commands_handle(command, params, request_id, session_generation);
      }
  #endif
@@ -129,7 +151,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
      if (strcmp(command, "device.list_vms") == 0) {
          return list_vms_command();
      }
-@@ -2858,6 +2913,7 @@
+@@ -2858,6 +2927,7 @@
  #if CONFIG_HOMEHUB_VOICE
      voice_init();
  #endif
@@ -187,3 +209,22 @@ diff --git a/esp32/components/muse/muse_audio.c b/esp32/components/muse/muse_aud
          for (size_t i = 0; i < n; i++) {
              s_out_stereo[2 * i] = mute ? 0 : mono[i];
              s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
+diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_state.c
+--- a/esp32/components/muse/muse_state.c
++++ b/esp32/components/muse/muse_state.c
+@@ -27,6 +27,7 @@
+ 
+ #include "muse_lang.h"
+ #include "muse_text.h"
++#include "stackchan_hw.h"
+ 
+ #define HAPPY_SECS 1.6f
+ 
+@@ -81,6 +82,7 @@
+     }
+     s_mode_since_us = esp_timer_get_time();
+     s_mode = mode;
++    stackchan_hw_ui_mode((int)mode);   /* LEDs for listening / thinking */
+ }
+ 
+ muse_mode_t muse_state_mode(float *secs_in_mode)

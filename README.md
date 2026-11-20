@@ -82,12 +82,16 @@ Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`
 | `>sway=DEG,HALF_MS[,UP]` | 首振りの振れ幅、片道の時間、見上げる角度を変える（既定 15°, 700ms, 8°。再起動で戻る） |
 | `>swaytest=SEC` | 話しかけずに、首振りを SEC 秒だけ動かす（調整用） |
 | `>pet=0` / `1` | ナデナデの反応を止める / 戻す |
+| `>ledfx=NAME[,SPEED[,R,G,B[,R2,G2,B2]]]` | LED の演出。rainbow / breath / blink / strobe / chase / wave / alternate / solid、`off` で止める |
+| `>ledpreset=NAME` | party / ocean / christmas / rainbow / calm_breath / alert_red / warm_white / cool_blue |
+| `>uifx=0` / `1` | 聞いている・考え中の LED を止める / 戻す |
 | `>servo=off` → 手で正面に合わせる → `>servo=zero` → `>servo=on` | 正面（X 150, Y 90）の校正。NVS に保存。`>servo=zero_reset` で消す |
 | `>servo=trim=DX,DY` | 正面を DX/DY 度だけずらして保存（Y はマイナスで上向き） |
 | `>servo=pos` / `>touch` | デバッグ用。サーボの実位置とばねの状態 / 頭タッチの生の値 |
 | `>py32r=REG[,LEN]` / `>i2cr=ADDR,REG[,LEN]` | デバッグ用のレジスタ読み出し |
 
 - 発話中は、音量に合わせて LED が光り、少し見上げて（8°）首が左右に揺れる。終わると元の色・位置に戻る
+- LED は上の層から表示する: 発話（声に合わせてオレンジ）> ナデナデ（ピンク）> 聞いている（青の呼吸）・考え中（黄色の光が回る）> 演出 > 基本色。Muse からは `stackchan.led` の `effect` / `preset` で演出を指定できる
 - 頭を前後になでると（タップは無視）、LED がピンクになり、見上げるか首をかしげる。手を離して 3 秒で元に戻る。発話中は反応しない
 - Y は小さいほど見上げる（Y 70〜90 = 水平から最大 20° 上）
 - サーボは公式 StackChan ファームと同じく、ESP32 側のばねモデルを 50Hz で計算し、20ms の移動として送る

@@ -8,7 +8,7 @@ import sys, pathlib, subprocess, tempfile, shutil
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c", "main/sdk_token_console.c",
-         "components/muse/CMakeLists.txt", "components/muse/muse_audio.c"]
+         "components/muse/CMakeLists.txt", "components/muse/muse_audio.c", "components/muse/muse_state.c"]
 
 
 def sub1(s, old, new):
@@ -31,16 +31,24 @@ def noise(s):
              'static void add_command(cJSON *commands, const char *name,')
     cmds = (
         '    {\n'
-        '        cJSON *rgb = cJSON_CreateObject();\n'
-        '        cJSON_AddItemToObject(rgb, "r", int_param("Red, 0 to 255."));\n'
-        '        cJSON_AddItemToObject(rgb, "g", int_param("Green, 0 to 255."));\n'
-        '        cJSON_AddItemToObject(rgb, "b", int_param("Blue, 0 to 255."));\n'
+        '        cJSON *led = cJSON_CreateObject();\n'
+        '        cJSON_AddItemToObject(led, "r", int_param("Red, 0 to 255."));\n'
+        '        cJSON_AddItemToObject(led, "g", int_param("Green, 0 to 255."));\n'
+        '        cJSON_AddItemToObject(led, "b", int_param("Blue, 0 to 255."));\n'
+        '        cJSON_AddItemToObject(led, "effect", string_param("rainbow, breath, blink, strobe, chase, wave, alternate, solid, or off to stop."));\n'
+        '        cJSON_AddItemToObject(led, "preset", string_param("party, ocean, christmas, rainbow, calm_breath, alert_red, warm_white or cool_blue."));\n'
+        '        cJSON_AddItemToObject(led, "speed", int_param("Effect speed, 1 (slow) to 10 (fast); default 5."));\n'
+        '        cJSON_AddItemToObject(led, "r2", int_param("Second colour for alternate: red."));\n'
+        '        cJSON_AddItemToObject(led, "g2", int_param("Second colour for alternate: green."));\n'
+        '        cJSON_AddItemToObject(led, "b2", int_param("Second colour for alternate: blue."));\n'
         '        add_command(commands, "stackchan.led",\n'
-        '                    "Light all 12 LEDs of the Stack-chan body in one colour. 0,0,0 turns them off.",\n'
-        '                    rgb, nullptr);\n'
+        '                    "Light the 12 LEDs of the Stack-chan body. Give r, g, b for one steady colour "\n'
+        '                    "(0,0,0 turns them off); or an effect, coloured by r, g, b (and r2, g2, b2) at a speed; "\n'
+        '                    "or a preset. While it listens, thinks or speaks, those lights come first.",\n'
+        '                    nullptr, led);\n'
         '        cJSON *pose = cJSON_CreateObject();\n'
         '        cJSON_AddItemToObject(pose, "x", int_param("Pan angle in degrees, 60 to 240; 150 is centre."));\n'
-        '        cJSON_AddItemToObject(pose, "y", int_param("Tilt angle in degrees, 70 to 90; 90 is level."));\n'
+        '        cJSON_AddItemToObject(pose, "y", int_param("Tilt angle in degrees, 70 to 90; 90 is the resting position, smaller looks up."));\n'
         '        cJSON_AddItemToObject(pose, "ms", int_param("Time to get there in milliseconds, at least 150; default 600."));\n'
         '        add_command(commands, "stackchan.servo",\n'
         '                    "Move the Stack-chan head. With no x and y it returns to centre. "\n'
@@ -58,20 +66,34 @@ static int json_int(cJSON *params, const char *key, int fallback, bool *present)
     return cJSON_IsNumber(item) ? item->valueint : fallback;
 }
 
+static int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
 static cJSON *stackchan_command(const char *command, cJSON *params) {
     if (strcmp(command, "stackchan.led") == 0) {
-        bool r_ok, g_ok, b_ok;
-        int r = json_int(params, "r", 0, &r_ok);
-        int g = json_int(params, "g", 0, &g_ok);
-        int b = json_int(params, "b", 0, &b_ok);
-        if (!r_ok || !g_ok || !b_ok) return command_error("missing_param", "r, g and b are required");
         if (!stackchan_led_ready()) return command_error("unavailable", "LEDs are not available");
-        r = r < 0 ? 0 : (r > 255 ? 255 : r);
-        g = g < 0 ? 0 : (g > 255 ? 255 : g);
-        b = b < 0 ? 0 : (b > 255 ? 255 : b);
-        if (stackchan_led_fill((uint8_t)r, (uint8_t)g, (uint8_t)b) != ESP_OK) {
-            return command_error("io_error", "LED update failed");
+        bool r_ok, g_ok, b_ok, unused;
+        int r = clamp255(json_int(params, "r", 0, &r_ok));
+        int g = clamp255(json_int(params, "g", 0, &g_ok));
+        int b = clamp255(json_int(params, "b", 0, &b_ok));
+        int r2 = clamp255(json_int(params, "r2", 0, &unused));
+        int g2 = clamp255(json_int(params, "g2", 0, &unused));
+        int b2 = clamp255(json_int(params, "b2", 0, &unused));
+        int speed = json_int(params, "speed", 0, &unused);
+        cJSON *preset = params ? cJSON_GetObjectItem(params, "preset") : NULL;
+        cJSON *effect = params ? cJSON_GetObjectItem(params, "effect") : NULL;
+        esp_err_t err;
+        if (cJSON_IsString(preset) && preset->valuestring) {
+            err = stackchan_led_preset(preset->valuestring);
+            if (err == ESP_ERR_NOT_FOUND) return command_error("bad_param", "unknown preset");
+        } else if (cJSON_IsString(effect) && effect->valuestring) {
+            err = stackchan_led_effect(effect->valuestring, (uint8_t)r, (uint8_t)g, (uint8_t)b,
+                                       (uint8_t)r2, (uint8_t)g2, (uint8_t)b2, speed);
+            if (err == ESP_ERR_NOT_FOUND) return command_error("bad_param", "unknown effect");
+        } else {
+            if (!r_ok || !g_ok || !b_ok) return command_error("missing_param", "give r, g and b, an effect or a preset");
+            err = stackchan_led_fill((uint8_t)r, (uint8_t)g, (uint8_t)b);
         }
+        if (err != ESP_OK) return command_error("io_error", "LED update failed");
         cJSON *result = cJSON_CreateObject();
         cJSON_AddBoolToObject(result, "ok", true);
         return result;
@@ -142,8 +164,16 @@ def muse_audio(s):
     return sub1(s, old, new)
 
 
+def muse_state(s):
+    s = sub1(s, '#include "muse_text.h"\n', '#include "muse_text.h"\n#include "stackchan_hw.h"\n')
+    return sub1(s, "    s_mode_since_us = esp_timer_get_time();\n    s_mode = mode;\n}",
+                "    s_mode_since_us = esp_timer_get_time();\n    s_mode = mode;\n"
+                "    stackchan_hw_ui_mode((int)mode);   /* LEDs for listening / thinking */\n}")
+
+
 EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app, "main/sdk_token_console.c": console,
-         "components/muse/CMakeLists.txt": muse_cmake, "components/muse/muse_audio.c": muse_audio}
+         "components/muse/CMakeLists.txt": muse_cmake, "components/muse/muse_audio.c": muse_audio,
+         "components/muse/muse_state.c": muse_state}
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 try:

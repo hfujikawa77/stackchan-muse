@@ -434,25 +434,182 @@ static gesture_t touch_update(const uint8_t level[3]) {
 
 static int rand_between(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
 
-static void led_fill_buffer(uint8_t r, uint8_t g, uint8_t b) {
-    for (uint8_t i = 0; i < STACKCHAN_LED_COUNT; i++) stackchan_led_set(i, r, g, b);
+// ---- LEDs: layers and effects (#11) ---------------------------------------------------
+// The LEDs show the top layer that is active: speech > pet > listening/thinking > an effect
+// > the base colours (stackchan_led_set/fill). Each layer is drawn into s_led_ram (the frame)
+// by hw_task; when a layer ends, the one below simply shows again, so nothing has to save
+// and restore colours. Effects follow the HermesLLM patterns.
+static uint8_t s_base[STACKCHAN_LED_COUNT * 2];   // base colours, RGB565 as in the LED RAM
+static volatile bool s_base_dirty;
+static volatile bool s_task_running;
+static volatile int s_ui_mode;                    // muse_mode_t, from stackchan_hw_ui_mode()
+static volatile bool s_ui_fx_on = true;
+
+typedef struct {
+    int fx;
+    uint8_t r, g, b, r2, g2, b2;
+    int speed;   // 1..10
+} fx_t;
+static fx_t s_fx;                                 // the effect layer; fx == STACKCHAN_FX_NONE is off
+static volatile bool s_fx_dirty;
+static portMUX_TYPE s_fx_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static const char *const k_fx_names[] = {"off", "solid", "blink", "breath", "chase", "rainbow", "wave", "alternate"};
+
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
-// One task for the 5 V guard and the speech animation, to keep internal RAM down.
+static void frame_set(int i, uint8_t r, uint8_t g, uint8_t b) {
+    uint16_t v = rgb565(r, g, b);
+    s_led_ram[i * 2] = (uint8_t)(v & 0xFF);
+    s_led_ram[i * 2 + 1] = (uint8_t)(v >> 8);
+}
+
+static void frame_fill(uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < STACKCHAN_LED_COUNT; i++) frame_set(i, r, g, b);
+}
+
+static uint8_t scale8(uint8_t v, float k) { return (uint8_t)(v * k); }
+
+// Sends s_led_ram to the LEDs.
+static esp_err_t frame_send(void) {
+    if (!s_led_ready) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = py32_write(REG_LED_RAM_START, s_led_ram, sizeof(s_led_ram));
+    if (err == ESP_OK) {
+        uint8_t cfg = 0;
+        err = py32_read8(REG_LED_CFG, &cfg);
+        if (err == ESP_OK) err = py32_write8(REG_LED_CFG, cfg | (1 << 6));
+    }
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+// Full-saturation hue (degrees) to RGB.
+static void hue_rgb(int hue, uint8_t *r, uint8_t *g, uint8_t *b) {
+    hue %= 360;
+    if (hue < 0) hue += 360;
+    int x = (hue % 60) * 255 / 60;
+    switch (hue / 60) {
+    case 0: *r = 255; *g = x; *b = 0; break;
+    case 1: *r = 255 - x; *g = 255; *b = 0; break;
+    case 2: *r = 0; *g = 255; *b = x; break;
+    case 3: *r = 0; *g = 255 - x; *b = 255; break;
+    case 4: *r = x; *g = 0; *b = 255; break;
+    default: *r = 255; *g = 0; *b = 255 - x; break;
+    }
+}
+
+// Draws one frame of an effect at time t (ms) into s_led_ram. Speed 1 (slow) .. 10 (fast).
+static void render_fx(const fx_t *f, uint32_t t) {
+    int sp = f->speed < 1 ? 1 : (f->speed > 10 ? 10 : f->speed);
+    switch (f->fx) {
+    case STACKCHAN_FX_SOLID:
+        frame_fill(f->r, f->g, f->b);
+        break;
+    case STACKCHAN_FX_BLINK: {   // also the strobe: speed 5 is 2.5 flashes a second
+        uint32_t period = 2000 / sp, on = period / 4 < 40 ? 40 : period / 4;
+        bool lit = (t % period) < on;
+        frame_fill(lit ? f->r : 0, lit ? f->g : 0, lit ? f->b : 0);
+        break;
+    }
+    case STACKCHAN_FX_BREATH: {
+        uint32_t period = 1000 + 6000 / sp;   // speed 5: 2.2 s
+        float k = (1.0f - cosf(2.0f * (float)M_PI * (float)(t % period) / period)) / 2.0f;
+        k = 0.04f + 0.96f * k;
+        frame_fill(scale8(f->r, k), scale8(f->g, k), scale8(f->b, k));
+        break;
+    }
+    case STACKCHAN_FX_CHASE: {   // three dots a third of the ring apart, with a short tail
+        uint32_t step = 600 / sp;            // speed 5: 120 ms per LED
+        int pos = (int)((t / step) % STACKCHAN_LED_COUNT);
+        frame_fill(0, 0, 0);
+        for (int k = 0; k < 3; k++) {
+            int i = (pos + k * 4) % STACKCHAN_LED_COUNT;
+            int tail = (i + STACKCHAN_LED_COUNT - 1) % STACKCHAN_LED_COUNT;
+            frame_set(tail, scale8(f->r, 0.25f), scale8(f->g, 0.25f), scale8(f->b, 0.25f));
+            frame_set(i, f->r, f->g, f->b);
+        }
+        break;
+    }
+    case STACKCHAN_FX_RAINBOW: {
+        int base = (int)((t * (uint32_t)sp * 36u / 1000u) % 360u);   // speed 5: a turn in 2 s
+        for (int i = 0; i < STACKCHAN_LED_COUNT; i++) {
+            uint8_t r, g, b;
+            hue_rgb(base + i * 360 / STACKCHAN_LED_COUNT, &r, &g, &b);
+            frame_set(i, r, g, b);
+        }
+        break;
+    }
+    case STACKCHAN_FX_WAVE: {
+        uint32_t period = 6000 / sp;         // speed 5: 1.2 s for the wave to go round
+        float ph = (float)(t % period) / period;
+        for (int i = 0; i < STACKCHAN_LED_COUNT; i++) {
+            float k = (1.0f + sinf(2.0f * (float)M_PI * ((float)i / STACKCHAN_LED_COUNT - ph))) / 2.0f;
+            k = 0.05f + 0.95f * k;
+            frame_set(i, scale8(f->r, k), scale8(f->g, k), scale8(f->b, k));
+        }
+        break;
+    }
+    case STACKCHAN_FX_ALTERNATE: {
+        uint32_t interval = 1500 / sp;       // speed 5: swap every 300 ms
+        bool swap = (t / interval) & 1;
+        for (int i = 0; i < STACKCHAN_LED_COUNT; i++) {
+            bool first = ((i & 1) == 0) != swap;
+            frame_set(i, first ? f->r : f->r2, first ? f->g : f->g2, first ? f->b : f->b2);
+        }
+        break;
+    }
+    default:
+        frame_fill(0, 0, 0);
+        break;
+    }
+}
+
+static void fx_get(fx_t *f) {
+    taskENTER_CRITICAL(&s_fx_mux);
+    *f = s_fx;
+    taskEXIT_CRITICAL(&s_fx_mux);
+}
+
+static void fx_put(const fx_t *f) {
+    taskENTER_CRITICAL(&s_fx_mux);
+    s_fx = *f;
+    taskEXIT_CRITICAL(&s_fx_mux);
+    s_fx_dirty = true;
+}
+
+// Without a task to draw them, base colours go straight out.
+static void base_changed(void) {
+    s_base_dirty = true;
+    if (!s_task_running) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        memcpy(s_led_ram, s_base, sizeof(s_led_ram));
+        xSemaphoreGive(s_lock);
+        frame_send();
+    }
+}
+
+enum { L_BASE, L_FX, L_UI, L_PET, L_SPEAK };
+
+// One task for the 5 V guard, the head touch, the speech animation and the LED layers,
+// to keep internal RAM down.
 static void hw_task(void *arg) {
     (void)arg;
+    s_task_running = true;
     uint32_t guard_ms = 0, speak_start = 0, sway_next = 0, probe_ms = 0, led_tick = 0;
     int dir = 1;
     // pet reaction state
     uint32_t touch_tick = 0, pet_restore_at = 0;
     bool happy = false, wait_restore = false;
-    uint8_t pet_saved_led[sizeof(s_led_ram)];
     int pet_x = STACKCHAN_SERVO_X_CENTER, pet_y = STACKCHAN_SERVO_Y_CENTER;
     bool speaking = false;
-    uint8_t saved_led[sizeof(s_led_ram)];
     int saved_x = STACKCHAN_SERVO_X_CENTER, saved_y = STACKCHAN_SERVO_Y_CENTER;
     float smooth = 0;
     int shown = -1;
+    int layer = -1;          // LED layer drawn last
+    bool led_force = true;   // redraw on the next LED frame
     uint32_t prev = now_ms(), max_gap = 0, ticks = 0, late = 0;   // timing stats per speech
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(ANIM_TICK_MS));
@@ -470,7 +627,7 @@ static void hw_task(void *arg) {
             guard_ms = 0;
             if (bus_5v_assert() && s_led_ready) {
                 vTaskDelay(pdMS_TO_TICKS(20));   // LEDs lose their colour without power: send it again
-                stackchan_led_show();
+                led_force = true;
             }
         }
 
@@ -481,18 +638,11 @@ static void hw_task(void *arg) {
             if (g == G_SWIPE_FWD || g == G_SWIPE_BACK) {
                 ESP_LOGI(TAG, "head: stroke %s", g == G_SWIPE_FWD ? "forward" : "backward");
                 if (s_pet_on && !speaking) {
-                    if (!happy) {   // remember how things were, to go back to
+                    if (!happy) {   // remember where the head was, to go back to
                         happy = true;
-                        xSemaphoreTake(s_lock, portMAX_DELAY);
-                        memcpy(pet_saved_led, s_led_ram, sizeof(pet_saved_led));
-                        xSemaphoreGive(s_lock);
                         stackchan_servo_position(&pet_x, &pet_y);
                     }
                     wait_restore = false;   // still being stroked
-                    if (s_led_ready) {
-                        led_fill_buffer(PET_R, PET_G, PET_B);
-                        stackchan_led_show();
-                    }
                     bool moving;
                     taskENTER_CRITICAL(&s_spring_mux);
                     moving = s_spx.active || s_spy.active;
@@ -531,12 +681,6 @@ static void hw_task(void *arg) {
         if (happy && wait_restore && (int32_t)(now - pet_restore_at) >= 0) {
             happy = false;
             wait_restore = false;
-            if (s_led_ready) {
-                xSemaphoreTake(s_lock, portMAX_DELAY);
-                memcpy(s_led_ram, pet_saved_led, sizeof(pet_saved_led));
-                xSemaphoreGive(s_lock);
-                stackchan_led_show();
-            }
             if (s_servo_ready) {
                 spring_aim(&s_spx, (float)pet_x, 900);
                 spring_aim(&s_spy, (float)pet_y, 900);
@@ -555,56 +699,97 @@ static void hw_task(void *arg) {
 
         if (voice && !speaking) {
             speaking = true;
-            xSemaphoreTake(s_lock, portMAX_DELAY);
-            memcpy(saved_led, s_led_ram, sizeof(saved_led));
-            xSemaphoreGive(s_lock);
             stackchan_servo_position(&saved_x, &saved_y);
             smooth = 0;
-            shown = -1;
             speak_start = now;
             sway_next = now;
             dir = 1;
-            led_tick = 0;
             max_gap = 0;
             ticks = 0;
             late = 0;
         } else if (!voice && speaking) {
             speaking = false;
-            if (s_led_ready) {
-                xSemaphoreTake(s_lock, portMAX_DELAY);
-                memcpy(s_led_ram, saved_led, sizeof(saved_led));
-                xSemaphoreGive(s_lock);
-                stackchan_led_show();
-            }
             if (s_servo_ready) stackchan_servo_move(saved_x, saved_y, 500);
             ESP_LOGI(TAG, "speech anim: %.1f s, %u ticks, max gap %u ms, %u ticks over 40 ms",
                      (now - speak_start) / 1000.0f, (unsigned)ticks, (unsigned)max_gap, (unsigned)late);
-            continue;
         }
-        if (!speaking) continue;
-        ticks++;
-        if (gap > max_gap) max_gap = gap;
-        if (gap > 40) late++;
+        if (speaking) {
+            ticks++;
+            if (gap > max_gap) max_gap = gap;
+            if (gap > 40) late++;
+            if (s_servo_ready && (int32_t)(now - sway_next) >= 0) {
+                // Swing to the other side: only the target changes; the spring does the easing.
+                uint32_t half = s_sway_half_ms;
+                spring_aim(&s_spx, saved_x + dir * s_sway_deg, half);
+                // Look up a little while talking (Y smaller = up); back down when the speech ends.
+                spring_aim(&s_spy, clampf(saved_y - s_sway_up, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX), half);
+                dir = -dir;
+                sway_next = now + half;
+            }
+        }
 
-        if (s_led_ready && ++led_tick >= LED_EVERY_TICKS) {
-            led_tick = 0;
+        // ---- LEDs: draw the top active layer ----
+        if (!s_led_ready || ++led_tick < LED_EVERY_TICKS) continue;
+        led_tick = 0;
+        int mode = s_ui_mode;
+        bool ui = s_ui_fx_on && (mode == STACKCHAN_UI_LISTENING || mode == STACKCHAN_UI_THINKING);
+        fx_t f;
+        fx_get(&f);
+        int want = speaking ? L_SPEAK : happy ? L_PET : ui ? L_UI : f.fx != STACKCHAN_FX_NONE ? L_FX : L_BASE;
+        bool changed = want != layer || led_force;
+        layer = want;
+        led_force = false;
+        switch (want) {
+        case L_SPEAK: {   // brightness follows the voice, like a mouth
             float l = s_level;
             smooth = l > smooth ? 0.5f * smooth + 0.5f * l : 0.75f * smooth + 0.25f * l;   // fast up, slow down
             int br = 30 + (int)(smooth * 225.0f);
+            if (changed) shown = -1;
             if (shown < 0 || br - shown >= 8 || shown - br >= 8) {
-                led_fill_buffer((uint8_t)(SPEAK_R * br / 255), (uint8_t)(SPEAK_G * br / 255), (uint8_t)(SPEAK_B * br / 255));
-                stackchan_led_show();
+                frame_fill((uint8_t)(SPEAK_R * br / 255), (uint8_t)(SPEAK_G * br / 255), (uint8_t)(SPEAK_B * br / 255));
+                frame_send();
                 shown = br;
             }
+            break;
         }
-        if (s_servo_ready && (int32_t)(now - sway_next) >= 0) {
-            // Swing to the other side: only the target changes; the spring does the easing.
-            uint32_t half = s_sway_half_ms;
-            spring_aim(&s_spx, saved_x + dir * s_sway_deg, half);
-            // Look up a little while talking (Y smaller = up); back down when the speech ends.
-            spring_aim(&s_spy, clampf(saved_y - s_sway_up, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX), half);
-            dir = -dir;
-            sway_next = now + half;
+        case L_PET:
+            if (changed) {
+                frame_fill(PET_R, PET_G, PET_B);
+                frame_send();
+            }
+            break;
+        case L_UI: {      // listening: blue breath; thinking: yellow dots going round (as HermesLLM)
+            fx_t u = {0};
+            if (mode == STACKCHAN_UI_LISTENING) {
+                u.fx = STACKCHAN_FX_BREATH;
+                u.b = 200;
+                u.speed = 7;
+            } else {
+                u.fx = STACKCHAN_FX_CHASE;
+                u.r = 180;
+                u.g = 160;
+                u.speed = 6;
+            }
+            render_fx(&u, now);
+            frame_send();
+            break;
+        }
+        case L_FX:
+            if (f.fx != STACKCHAN_FX_SOLID || changed || s_fx_dirty) {
+                s_fx_dirty = false;
+                render_fx(&f, now);
+                frame_send();
+            }
+            break;
+        default:
+            if (changed || s_base_dirty) {
+                s_base_dirty = false;
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                memcpy(s_led_ram, s_base, sizeof(s_led_ram));
+                xSemaphoreGive(s_lock);
+                frame_send();
+            }
+            break;
         }
     }
 }
@@ -664,8 +849,9 @@ esp_err_t stackchan_hw_init(void) {
     py32_bit(REG_GPIO_DRV_L, PIN_LED_DATA, false);
     py32_write8(REG_LED_CFG, STACKCHAN_LED_COUNT & 0x3F);
     memset(s_led_ram, 0, sizeof(s_led_ram));
+    memset(s_base, 0, sizeof(s_base));
     s_led_ready = true;
-    stackchan_led_show();
+    frame_send();
 
     // Servos: switch their power on (PY32 pin 0, output, pulled up, high), then open the UART.
     py32_bit(REG_GPIO_M_L, PIN_SERVO_POWER, true);
@@ -706,28 +892,24 @@ esp_err_t stackchan_hw_init(void) {
 bool stackchan_led_ready(void) { return s_led_ready; }
 bool stackchan_servo_ready(void) { return s_servo_ready; }
 
+// Base colours: shown when no other layer is active. Setting them stops an effect.
 esp_err_t stackchan_led_set(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
     if (!s_led_ready) return ESP_ERR_INVALID_STATE;
     if (index >= STACKCHAN_LED_COUNT) return ESP_ERR_INVALID_ARG;
-    uint16_t v = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    uint16_t v = rgb565(r, g, b);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_led_ram[index * 2] = (uint8_t)(v & 0xFF);
-    s_led_ram[index * 2 + 1] = (uint8_t)(v >> 8);
+    s_base[index * 2] = (uint8_t)(v & 0xFF);
+    s_base[index * 2 + 1] = (uint8_t)(v >> 8);
     xSemaphoreGive(s_lock);
+    fx_t off = {0};
+    fx_put(&off);
     return ESP_OK;
 }
 
 esp_err_t stackchan_led_show(void) {
     if (!s_led_ready) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    esp_err_t err = py32_write(REG_LED_RAM_START, s_led_ram, sizeof(s_led_ram));
-    if (err == ESP_OK) {
-        uint8_t cfg = 0;
-        err = py32_read8(REG_LED_CFG, &cfg);
-        if (err == ESP_OK) err = py32_write8(REG_LED_CFG, cfg | (1 << 6));
-    }
-    xSemaphoreGive(s_lock);
-    return err;
+    base_changed();
+    return ESP_OK;
 }
 
 esp_err_t stackchan_led_fill(uint8_t r, uint8_t g, uint8_t b) {
@@ -737,6 +919,61 @@ esp_err_t stackchan_led_fill(uint8_t r, uint8_t g, uint8_t b) {
     }
     return stackchan_led_show();
 }
+
+int stackchan_led_effect_from_name(const char *name) {
+    if (!name) return -1;
+    if (!strcmp(name, "strobe")) return STACKCHAN_FX_BLINK;
+    for (int i = 0; i < (int)(sizeof(k_fx_names) / sizeof(k_fx_names[0])); i++) {
+        if (!strcmp(name, k_fx_names[i])) return i;
+    }
+    return -1;
+}
+
+esp_err_t stackchan_led_effect(const char *name, uint8_t r, uint8_t g, uint8_t b,
+                               uint8_t r2, uint8_t g2, uint8_t b2, int speed) {
+    if (!s_led_ready) return ESP_ERR_INVALID_STATE;
+    int fx = stackchan_led_effect_from_name(name);
+    if (fx < 0) return ESP_ERR_NOT_FOUND;
+    bool strobe = !strcmp(name, "strobe");
+    fx_t f = {.fx = fx, .r = r, .g = g, .b = b, .r2 = r2, .g2 = g2, .b2 = b2, .speed = speed};
+    if (f.speed <= 0) f.speed = strobe ? 8 : 5;
+    if (!(r | g | b)) {   // no colour given: a sensible one for the effect
+        switch (fx) {
+        case STACKCHAN_FX_BREATH: f.r = 0; f.g = 120; f.b = 200; break;
+        case STACKCHAN_FX_CHASE: f.r = 255; f.g = 140; f.b = 0; break;
+        case STACKCHAN_FX_WAVE: f.r = 0; f.g = 80; f.b = 200; break;
+        case STACKCHAN_FX_ALTERNATE: f.r = 255; f.g = 0; f.b = 0; break;
+        default: f.r = 255; f.g = 255; f.b = 255; break;
+        }
+    }
+    if (fx == STACKCHAN_FX_ALTERNATE && !(r2 | g2 | b2)) {
+        f.r2 = 0;
+        f.g2 = 200;
+        f.b2 = 0;
+    }
+    fx_put(&f);
+    return ESP_OK;
+}
+
+esp_err_t stackchan_led_preset(const char *name) {
+    if (!name) return ESP_ERR_NOT_FOUND;
+    // The HermesLLM presets.
+    if (!strcmp(name, "warm_white")) return stackchan_led_effect("solid", 255, 200, 120, 0, 0, 0, 5);
+    if (!strcmp(name, "cool_blue")) return stackchan_led_effect("solid", 0, 100, 255, 0, 0, 0, 5);
+    if (!strcmp(name, "alert_red")) return stackchan_led_effect("blink", 255, 0, 0, 0, 0, 0, 3);
+    if (!strcmp(name, "calm_breath")) return stackchan_led_effect("breath", 0, 120, 200, 0, 0, 0, 5);
+    if (!strcmp(name, "christmas")) return stackchan_led_effect("alternate", 255, 0, 0, 0, 200, 0, 7);
+    if (!strcmp(name, "ocean")) return stackchan_led_effect("wave", 0, 80, 200, 0, 0, 0, 5);
+    if (!strcmp(name, "rainbow")) return stackchan_led_effect("rainbow", 0, 0, 0, 0, 0, 0, 5);
+    if (!strcmp(name, "party")) {
+        return stackchan_led_effect("chase", (uint8_t)rand_between(100, 255), (uint8_t)rand_between(100, 255),
+                                    (uint8_t)rand_between(100, 255), 0, 0, 0, 9);
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+void stackchan_hw_ui_mode(int muse_mode) { s_ui_mode = muse_mode; }
+void stackchan_led_ui_effects(bool on) { s_ui_fx_on = on; }
 
 esp_err_t stackchan_servo_move(int x_deg, int y_deg, uint32_t ms) {
     if (!s_servo_ready) return ESP_ERR_INVALID_STATE;
@@ -839,6 +1076,21 @@ bool stackchan_hw_console_command(const char *line) {
     } else if (!strncmp(line, "pet=", 4)) {
         s_pet_on = line[4] == '1';
         printf("@pet %s\n", s_pet_on ? "on" : "off");
+    } else if (!strncmp(line, "ledfx=", 6)) {   // >ledfx=NAME[,SPEED[,R,G,B[,R2,G2,B2]]]
+        char name[16] = {0};
+        int sp = 0, r = 0, g = 0, bb = 0, r2 = 0, g2 = 0, b2 = 0;
+        int n = sscanf(line + 6, "%15[a-z_],%d,%d,%d,%d,%d,%d,%d", name, &sp, &r, &g, &bb, &r2, &g2, &b2);
+        esp_err_t err = n >= 1 ? stackchan_led_effect(name, (uint8_t)clampi(r, 0, 255), (uint8_t)clampi(g, 0, 255),
+                                                       (uint8_t)clampi(bb, 0, 255), (uint8_t)clampi(r2, 0, 255),
+                                                       (uint8_t)clampi(g2, 0, 255), (uint8_t)clampi(b2, 0, 255), sp)
+                               : ESP_ERR_INVALID_ARG;
+        printf("@ledfx %s %s\n", name, err == ESP_OK ? "ok" : esp_err_to_name(err));
+    } else if (!strncmp(line, "ledpreset=", 10)) {
+        esp_err_t err = stackchan_led_preset(line + 10);
+        printf("@ledpreset %s %s\n", line + 10, err == ESP_OK ? "ok" : esp_err_to_name(err));
+    } else if (!strncmp(line, "uifx=", 5)) {   // >uifx=0|1  listening / thinking LEDs
+        stackchan_led_ui_effects(line[5] == '1');
+        printf("@uifx %s\n", line[5] == '1' ? "on" : "off");
     } else if (!strncmp(line, "anim=", 5)) {
         stackchan_hw_set_speech_anim(line[5] == '1');
         printf("@anim %s\n", line[5] == '1' ? "on" : "off");
