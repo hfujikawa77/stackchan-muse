@@ -166,6 +166,9 @@ def muse_audio(s):
 
 def muse_state(s):
     s = sub1(s, '#include "muse_text.h"\n', '#include "muse_text.h"\n#include "stackchan_hw.h"\n')
+    s = sub1(s, "void muse_state_init(void)\n{\n",
+             "void muse_state_init(void)\n{\n"
+             "    stackchan_hw_set_pet_callback(muse_state_make_happy);   /* head pats make the face happy */\n")
     return sub1(s, "    s_mode_since_us = esp_timer_get_time();\n    s_mode = mode;\n}",
                 "    s_mode_since_us = esp_timer_get_time();\n    s_mode = mode;\n"
                 "    stackchan_hw_ui_mode((int)mode);   /* LEDs for listening / thinking */\n}")

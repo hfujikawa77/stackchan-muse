@@ -63,6 +63,10 @@ esp_err_t stackchan_led_preset(const char *name);
 void stackchan_hw_ui_mode(int muse_mode);
 void stackchan_led_ui_effects(bool on);
 
+// Called when the head is stroked, and every second while the robot stays happy, so the face
+// can show it. Muse registers muse_state_make_happy() (hop, blush, hearts).
+void stackchan_hw_set_pet_callback(void (*cb)(void));
+
 // Servos. Out-of-range angles are clamped to the soft limits, not rejected.
 esp_err_t stackchan_servo_move(int x_deg, int y_deg, uint32_t ms);
 esp_err_t stackchan_servo_center(uint32_t ms);

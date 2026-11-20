@@ -362,6 +362,8 @@ static i2c_master_dev_handle_t s_si12t;
 static bool s_touch_ready;
 static volatile bool s_pet_on = true;
 static volatile uint8_t s_touch_raw;   // last OUTPUT1, for >touch
+static void (*volatile s_pet_cb)(void);   // the face's happy reaction (muse_state_make_happy)
+#define PET_FACE_EVERY_MS   1000   // the face stays happy 1.6 s per call: renew it while happy
 
 typedef enum { G_NONE, G_PRESS, G_RELEASE, G_SWIPE_FWD, G_SWIPE_BACK } gesture_t;
 
@@ -601,7 +603,7 @@ static void hw_task(void *arg) {
     uint32_t guard_ms = 0, speak_start = 0, sway_next = 0, probe_ms = 0, led_tick = 0;
     int dir = 1;
     // pet reaction state
-    uint32_t touch_tick = 0, pet_restore_at = 0;
+    uint32_t touch_tick = 0, pet_restore_at = 0, pet_face_at = 0;
     bool happy = false, wait_restore = false;
     int pet_x = STACKCHAN_SERVO_X_CENTER, pet_y = STACKCHAN_SERVO_Y_CENTER;
     bool speaking = false;
@@ -643,6 +645,8 @@ static void hw_task(void *arg) {
                         stackchan_servo_position(&pet_x, &pet_y);
                     }
                     wait_restore = false;   // still being stroked
+                    if (s_pet_cb) s_pet_cb();   // hop, blush and hearts on the face
+                    pet_face_at = now + PET_FACE_EVERY_MS;
                     bool moving;
                     taskENTER_CRITICAL(&s_spring_mux);
                     moving = s_spx.active || s_spy.active;
@@ -677,6 +681,10 @@ static void hw_task(void *arg) {
             } else if (g == G_PRESS) {
                 ESP_LOGI(TAG, "head: touch");
             }
+        }
+        if (happy && s_pet_cb && (int32_t)(now - pet_face_at) >= 0) {
+            s_pet_cb();
+            pet_face_at = now + PET_FACE_EVERY_MS;
         }
         if (happy && wait_restore && (int32_t)(now - pet_restore_at) >= 0) {
             happy = false;
@@ -1195,3 +1203,5 @@ void stackchan_hw_audio_level(float level) {
 }
 
 void stackchan_hw_set_speech_anim(bool on) { s_anim_on = on; }
+
+void stackchan_hw_set_pet_callback(void (*cb)(void)) { s_pet_cb = cb; }

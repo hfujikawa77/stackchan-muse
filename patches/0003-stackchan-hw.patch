@@ -220,7 +220,15 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
  
  #define HAPPY_SECS 1.6f
  
-@@ -81,6 +82,7 @@
+@@ -60,6 +61,7 @@
+ 
+ void muse_state_init(void)
+ {
++    stackchan_hw_set_pet_callback(muse_state_make_happy);   /* head pats make the face happy */
+     static StaticSemaphore_t lock;
+     s_format_lock = xSemaphoreCreateMutexStatic(&lock);
+     static StaticEventGroup_t wake;
+@@ -81,6 +83,7 @@
      }
      s_mode_since_us = esp_timer_get_time();
      s_mode = mode;
