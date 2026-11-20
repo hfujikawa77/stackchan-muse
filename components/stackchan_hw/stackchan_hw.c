@@ -85,6 +85,7 @@ static int s_y = STACKCHAN_SERVO_Y_CENTER;
 // Sway defaults; >sway=DEG,HALF_MS changes them at run time for tuning.
 #define SWAY_DEG_DEFAULT      15.0f   // either side of where the head was
 #define SWAY_HALF_MS_DEFAULT  700     // each swing; the spring is tuned to arrive in about this long
+#define SWAY_UP_DEFAULT       8.0f    // look up this much while speaking
 #define SPEAK_R 255
 #define SPEAK_G 120
 #define SPEAK_B 60
@@ -96,6 +97,7 @@ static volatile float s_level;
 static volatile bool s_anim_on = true;
 static volatile float s_sway_deg = SWAY_DEG_DEFAULT;
 static volatile uint32_t s_sway_half_ms = SWAY_HALF_MS_DEFAULT;
+static volatile float s_sway_up = SWAY_UP_DEFAULT;
 static volatile uint32_t s_fake_voice_until;   // >swaytest: animate as if speaking until then
 static volatile bool s_fake_voice;
 
@@ -599,6 +601,8 @@ static void hw_task(void *arg) {
             // Swing to the other side: only the target changes; the spring does the easing.
             uint32_t half = s_sway_half_ms;
             spring_aim(&s_spx, saved_x + dir * s_sway_deg, half);
+            // Look up a little while talking (Y smaller = up); back down when the speech ends.
+            spring_aim(&s_spy, clampf(saved_y - s_sway_up, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX), half);
             dir = -dir;
             sway_next = now + half;
         }
@@ -812,12 +816,16 @@ bool stackchan_hw_console_command(const char *line) {
             for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
             printf("\n");
         }
-    } else if (!strncmp(line, "sway=", 5)) {   // >sway=DEG,HALF_MS  tune the speech sway
-        if (sscanf(line + 5, "%d,%d", &a, &b) == 2 && a >= 0 && a <= 40 && b >= 200 && b <= 3000) {
+    } else if (!strncmp(line, "sway=", 5)) {   // >sway=DEG,HALF_MS[,UP]  tune the speech sway
+        c = (int)s_sway_up;
+        if (sscanf(line + 5, "%d,%d,%d", &a, &b, &c) >= 2 && a >= 0 && a <= 40 && b >= 200 && b <= 3000 &&
+            c >= 0 && c <= 20) {
             s_sway_deg = (float)a;
             s_sway_half_ms = (uint32_t)b;
+            s_sway_up = (float)c;
         }
-        printf("@sway %d deg, %u ms per swing\n", (int)s_sway_deg, (unsigned)s_sway_half_ms);
+        printf("@sway %d deg, %u ms per swing, %d deg up\n", (int)s_sway_deg, (unsigned)s_sway_half_ms,
+               (int)s_sway_up);
     } else if (!strncmp(line, "swaytest=", 9)) {   // >swaytest=SECONDS  sway without speech
         a = atoi(line + 9);
         if (a < 1) a = 1;
