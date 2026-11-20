@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
@@ -79,8 +80,9 @@ static int s_y = STACKCHAN_SERVO_Y_CENTER;
 #define VOICE_LEVEL_MIN  0.08f
 #define VOICE_START_MS   300
 #define VOICE_HOLD_MS    1500   // quiet this long ends speech; shorter pauses between sentences do not
-#define SWAY_DEG         8.0f    // either side of where the head was
-#define SWAY_HALF_MS     900     // each swing; the spring is tuned to arrive in about this long
+// Sway defaults; >sway=DEG,HALF_MS changes them at run time for tuning.
+#define SWAY_DEG_DEFAULT      12.0f   // either side of where the head was
+#define SWAY_HALF_MS_DEFAULT  900     // each swing; the spring is tuned to arrive in about this long
 #define SPEAK_R 255
 #define SPEAK_G 120
 #define SPEAK_B 60
@@ -90,6 +92,10 @@ static volatile uint32_t s_voice_last_ms;   // last chunk above VOICE_LEVEL_MIN
 static volatile uint32_t s_voice_run_ms;    // start of the current run of sound
 static volatile float s_level;
 static volatile bool s_anim_on = true;
+static volatile float s_sway_deg = SWAY_DEG_DEFAULT;
+static volatile uint32_t s_sway_half_ms = SWAY_HALF_MS_DEFAULT;
+static volatile uint32_t s_fake_voice_until;   // >swaytest: animate as if speaking until then
+static volatile bool s_fake_voice;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -331,6 +337,10 @@ static void hw_task(void *arg) {
         // now - last would then wrap to a huge "quiet" and end the speech mid-sentence.
         bool voice = s_anim_on && s_voice_seen && (int32_t)(now - last) < VOICE_HOLD_MS &&
                      (speaking || (int32_t)(last - run) >= VOICE_START_MS);
+        if (s_fake_voice) {
+            if ((int32_t)(now - s_fake_voice_until) < 0) voice = true;
+            else s_fake_voice = false;
+        }
 
         if (voice && !speaking) {
             speaking = true;
@@ -378,9 +388,10 @@ static void hw_task(void *arg) {
         }
         if (s_servo_ready && (int32_t)(now - sway_next) >= 0) {
             // Swing to the other side: only the target changes; the spring does the easing.
-            spring_aim(&s_spx, saved_x + dir * SWAY_DEG, SWAY_HALF_MS);
+            uint32_t half = s_sway_half_ms;
+            spring_aim(&s_spx, saved_x + dir * s_sway_deg, half);
             dir = -dir;
-            sway_next = now + SWAY_HALF_MS;
+            sway_next = now + half;
         }
     }
 }
@@ -585,6 +596,19 @@ bool stackchan_hw_console_command(const char *line) {
             for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
             printf("\n");
         }
+    } else if (!strncmp(line, "sway=", 5)) {   // >sway=DEG,HALF_MS  tune the speech sway
+        if (sscanf(line + 5, "%d,%d", &a, &b) == 2 && a >= 0 && a <= 40 && b >= 200 && b <= 3000) {
+            s_sway_deg = (float)a;
+            s_sway_half_ms = (uint32_t)b;
+        }
+        printf("@sway %d deg, %u ms per swing\n", (int)s_sway_deg, (unsigned)s_sway_half_ms);
+    } else if (!strncmp(line, "swaytest=", 9)) {   // >swaytest=SECONDS  sway without speech
+        a = atoi(line + 9);
+        if (a < 1) a = 1;
+        if (a > 30) a = 30;
+        s_fake_voice_until = now_ms() + (uint32_t)a * 1000;
+        s_fake_voice = true;
+        printf("@swaytest %d s\n", a);
     } else if (!strncmp(line, "anim=", 5)) {
         stackchan_hw_set_speech_anim(line[5] == '1');
         printf("@anim %s\n", line[5] == '1' ? "on" : "off");
