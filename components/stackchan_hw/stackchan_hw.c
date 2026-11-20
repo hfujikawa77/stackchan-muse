@@ -167,7 +167,7 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v
 
 // Pings both servos; on success marks them ready. Servos switched on a moment ago can take
 // a while to answer, and some boots they miss the first ping, so callers retry.
-static void motion_teleport_to_present(void);
+static bool motion_teleport_to_present(void);
 
 static bool servo_probe(void) {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -291,7 +291,9 @@ static void spin_x(bool on, int speed) {
     xSemaphoreGive(s_lock);
 }
 
-// Steps both springs and sends the result while either is moving.
+static volatile int s_resend_ticks;   // keep sending the spring position this many ticks more
+
+// Steps both springs and sends the result while either is moving (or a resend is pending).
 static void motion_tick(void) {
     spring_t x, y;
     taskENTER_CRITICAL(&s_spring_mux);
@@ -301,6 +303,10 @@ static void motion_tick(void) {
     x = s_spx;
     y = s_spy;
     taskEXIT_CRITICAL(&s_spring_mux);
+    if (s_resend_ticks > 0) {
+        s_resend_ticks--;
+        moving = true;
+    }
     if (moving) servo_send(x.pos, y.pos);
 }
 
@@ -322,13 +328,14 @@ static float scs_read_deg(uint8_t id) {
 }
 
 // Start the springs where the head really is, so the first move does not snap.
-static void motion_teleport_to_present(void) {
+// False if the servos could not be read (the springs keep what they had).
+static bool motion_teleport_to_present(void) {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     float x = scs_read_deg(SCS_ID_X), y = scs_read_deg(SCS_ID_Y);
     xSemaphoreGive(s_lock);
     if (x < 0 || y < 0) {
-        ESP_LOGW(TAG, "could not read servo positions; assuming centre");
-        return;
+        ESP_LOGW(TAG, "could not read servo positions; keeping the last known");
+        return false;
     }
     taskENTER_CRITICAL(&s_spring_mux);
     s_spx.pos = s_spx.target = x;
@@ -339,6 +346,7 @@ static void motion_teleport_to_present(void) {
     s_x = (int)lroundf(x);
     s_y = (int)lroundf(y);
     ESP_LOGI(TAG, "servo position x=%.1f y=%.1f", x, y);
+    return true;
 }
 
 // Sets BUS_EN / BOOST_EN if either is clear. Read and write back to back, so a bit the
@@ -396,6 +404,8 @@ static void (*volatile s_pet_cb)(void);   // the face's happy reaction (muse_sta
 #define WAG_MS              1200    // a wag lasts this long
 #define WAG_STEP_MS         220
 #define WAG_DEG             8
+#define WAG_NOD_DEG         10      // a vertical wag (nod) looks up this much
+#define WAG_NOD_ONE_IN      4       // about one wag in four is a nod
 #define SPIN_SPEED          500     // as HermesLLM: 500 for 2 s is about one turn
 #define SPIN_MS             2000
 static volatile int s_fake_strokes;   // >stroke=N: as if stroked N times
@@ -643,6 +653,7 @@ static void hw_task(void *arg) {
     bool spinning = false, spun = false;
     uint32_t spin_end = 0, wag_until = 0, wag_next = 0;
     int wag_dir = 1;
+    bool wag_vertical = false;   // now and then the wag is a nod
     bool happy = false, wait_restore = false;
     int pet_x = STACKCHAN_SERVO_X_CENTER, pet_y = STACKCHAN_SERVO_Y_CENTER;
     bool speaking = false;
@@ -711,10 +722,11 @@ static void hw_task(void *arg) {
                         spin_x(true, SPIN_SPEED);
                         ESP_LOGI(TAG, "head: overjoyed, spinning");
                     } else if (s_servo_ready && joy >= JOY_WAG && !spinning) {
-                        // Happy: wag the head side to side, like a tail.
-                        if ((int32_t)(now - wag_until) >= 0) {
+                        // Happy: wag the head side to side, like a tail; now and then a nod instead.
+                        if ((int32_t)(now - wag_until) >= 0) {   // a new wag: pick its direction
                             wag_next = now;
                             wag_dir = 1;
+                            wag_vertical = rand_between(1, WAG_NOD_ONE_IN) == 1;
                         }
                         wag_until = now + WAG_MS;
                     } else if (s_servo_ready && !moving && !spinning) {
@@ -753,18 +765,34 @@ static void hw_task(void *arg) {
         if (spinning && (int32_t)(now - spin_end) >= 0) {
             spin_x(false, 0);
             spinning = false;
-            vTaskDelay(pdMS_TO_TICKS(30));
-            motion_teleport_to_present();   // springs from where the turn left the head
+            // The angle limits are in the servo's EEPROM: let the switch back land before
+            // talking to it. The turn rarely ends exactly round, and the last 60 deg of a turn
+            // are outside what the servo can measure, so the read may fail; and a single move
+            // sent too early can be lost, which left the head facing sideways. So: wait, read
+            // with retries, and keep sending the way home for a second.
+            vTaskDelay(pdMS_TO_TICKS(120));
+            bool found = false;
+            for (int i = 0; i < 3 && !found; i++) {
+                found = motion_teleport_to_present();   // springs from where the turn left the head
+                if (!found) vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            s_resend_ticks = 1000 / ANIM_TICK_MS;
             spring_aim(&s_spx, (float)pet_x, 800);
             ESP_LOGI(TAG, "head: spin done");
         }
         if (!spinning && happy && (int32_t)(now - wag_until) < 0 && (int32_t)(now - wag_next) >= 0) {
-            spring_aim(&s_spx, clampf((float)(pet_x + wag_dir * WAG_DEG), STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX),
-                       WAG_STEP_MS);
+            if (wag_vertical) {   // a nod: up and back (the resting pose is the lowest it goes)
+                float y = wag_dir > 0 ? (float)(pet_y - WAG_NOD_DEG) : (float)pet_y;
+                spring_aim(&s_spy, clampf(y, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX), WAG_STEP_MS);
+            } else {
+                spring_aim(&s_spx, clampf((float)(pet_x + wag_dir * WAG_DEG), STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX),
+                           WAG_STEP_MS);
+            }
             wag_dir = -wag_dir;
             wag_next = now + WAG_STEP_MS;
             if ((int32_t)(wag_until - wag_next) <= 0) {   // last step: back to centre
-                spring_aim(&s_spx, (float)pet_x, WAG_STEP_MS);
+                if (wag_vertical) spring_aim(&s_spy, (float)pet_y, WAG_STEP_MS);
+                else spring_aim(&s_spx, (float)pet_x, WAG_STEP_MS);
             }
         }
         if (spinning && pet_restore_at != 0) pet_restore_at = now + PET_RESTORE_MS;   // go back only after the turn
@@ -1113,9 +1141,15 @@ esp_err_t stackchan_servo_torque(bool on) {
     return ESP_OK;
 }
 
+// Where the head is going: the springs' targets. (A separate "last commanded" copy went stale
+// when the springs were aimed directly, e.g. home after a full turn, and the next pat then
+// reacted around the old angle, turning the head 90 degrees to one side.)
 void stackchan_servo_position(int *x_deg, int *y_deg) {
-    if (x_deg) *x_deg = s_x;
-    if (y_deg) *y_deg = s_y;
+    taskENTER_CRITICAL(&s_spring_mux);
+    float tx = s_spx.target, ty = s_spy.target;
+    taskEXIT_CRITICAL(&s_spring_mux);
+    if (x_deg) *x_deg = (int)lroundf(tx);
+    if (y_deg) *y_deg = (int)lroundf(ty);
 }
 
 bool stackchan_hw_console_command(const char *line) {
