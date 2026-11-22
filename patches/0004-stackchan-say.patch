@@ -1,0 +1,248 @@
+diff --git a/esp32/components/muse/muse_chat.h b/esp32/components/muse/muse_chat.h
+index 48f0e25..7fd372f 100644
+--- a/esp32/components/muse/muse_chat.h
++++ b/esp32/components/muse/muse_chat.h
+@@ -146,6 +146,14 @@ size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms
+ void muse_hatch_text_turn(char *text);
+ void muse_hatch_text_cancel(void);
+ 
++/*
++ * Stack-chan: for the voice task, while idle. True if a stackchan.say was
++ * waiting (stackchan_say_take); it then starts a turn of its own that speaks
++ * that text, played like any reply (muse_hatch_turn_event and the rest),
++ * without posting anything to the chat.
++ */
++bool muse_hatch_say_begin(void);
++
+ /*
+  * Prints one "@chat" line per call (more if `text` is long): the type, then the
+  * printf-style `fields` (JSON members, or NULL), then `text` escaped (or none).
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 670b524..9ee1e62 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -156,12 +156,12 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
+ 
+ /* ---- Voice task <-> session task ---- */
+ 
+-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
++enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_SAY };
+ 
+ struct cmd_t {
+     cmd_type_t type;
+     uint32_t gen;
+-    char *text;              /* CMD_TEXT: malloc'd, freed by the session task */
++    char *text;              /* CMD_TEXT, CMD_SAY: malloc'd, freed by the session task */
+ };
+ 
+ struct ev_t {
+@@ -264,6 +264,7 @@ struct turn_t {
+     msg_t msgs[MAX_MSGS];
+     int nmsgs;
+     bool agent_busy;
++    bool local;              /* stackchan.say: nothing from the chat belongs to it */
+     /* TTS */
+     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
+     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
+@@ -1503,7 +1504,7 @@ static void on_event(cJSON *line)
+         }
+         s_last_seq = v > s_last_seq ? v : s_last_seq;
+     }
+-    if (s_turn.phase != P_WAIT_REPLY) {
++    if (s_turn.phase != P_WAIT_REPLY || s_turn.local) {
+         return;
+     }
+     const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, "event")) ?: "";
+@@ -1585,6 +1586,32 @@ static void on_chat_ack(stream_t *s)
+     emit(MUSE_HATCH_EV_SENT, nullptr);
+ }
+ 
++static_assert(STACKCHAN_SAY_MAX < TEXT_MAX, "a say must fit one message's text");
++
++/*
++ * stackchan.say: a turn that posts nothing. Its one message is the text,
++ * local only (not in the chat), which start_tts() speaks through Google TTS
++ * and check_turn() ends once it's said.
++ */
++static void say_begin(uint32_t gen, const char *text)
++{
++    if (!turn_start(gen, false)) {   /* ends a typed turn in progress, as a press does */
++        return;   /* turn_fail told the voice task */
++    }
++    int64_t t = now_us();
++    s_turn.phase = P_WAIT_REPLY;
++    s_turn.chat_posted = s_turn.acked = true;
++    s_turn.chat_us = t;
++    s_turn.last_event_us = s_turn.last_content_us = t - SETTLE_US;   /* nothing more is coming */
++    s_turn.local = true;   /* on_event leaves it alone */
++    msg_t &m = s_turn.msgs[s_turn.nmsgs++];
++    m = msg_t{};
++    strlcpy(m.id, "local-say", sizeof(m.id));
++    append_text(m, text);
++    message_done(0, nullptr);
++    ESP_LOGI(TAG, "stackchan.say: %u bytes", (unsigned)m.len);
++}
++
+ /* ---- Turn: speech ---- */
+ 
+ static void start_tts(void)
+@@ -2125,6 +2152,12 @@ static void handle(const cmd_t &cmd)
+         break;
+     case CMD_WAKE:   /* only ends hatch_task's resting wait */
+         break;
++    case CMD_SAY:
++        if (cmd.gen == s_gen.load()) {
++            say_begin(cmd.gen, cmd.text);
++        }
++        free(cmd.text);
++        break;
+     }
+ }
+ 
+@@ -2394,6 +2427,27 @@ extern "C" void muse_hatch_text_cancel(void)
+     post(CMD_TEXT_CANCEL, 0);
+ }
+ 
++extern "C" bool muse_hatch_say_begin(void)
++{
++    if (!s_cmds) {
++        return false;
++    }
++    char *text = stackchan_say_take();
++    if (!text) {
++        return false;
++    }
++    /* Numbered like a press's turn, so a press that follows replaces it. */
++    uint32_t gen = ++s_gen;
++    drain_out();
++    cmd_t cmd{ CMD_SAY, gen, text };
++    if (xQueueSend(s_cmds, &cmd, pdMS_TO_TICKS(1000)) != pdTRUE) {
++        ESP_LOGW(TAG, "stackchan.say dropped: session busy");
++        free(text);
++        return false;
++    }
++    return true;
++}
++
+ extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
+ {
+     ev_t ev;
+diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
+index 40d0143..22c5aff 100644
+--- a/esp32/components/muse/muse_voice.c
++++ b/esp32/components/muse/muse_voice.c
+@@ -38,6 +38,7 @@
+ #include "muse_settings.h"
+ #include "muse_state.h"
+ #include "muse_wifi.h"
++#include "stackchan_tts.h"
+ #if CONFIG_MUSE_REALTIME_VOICE
+ #include "muse_voice_call.h"
+ #include "muse_voice_call_core.h"
+@@ -1270,7 +1271,8 @@ static void voice_task(void *arg)
+             muse_input_event_t ev;
+             bool asleep = muse_state_asleep();
+             bool battery = muse_state_on_battery();
+-            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;
++            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback
++                        && !stackchan_say_waiting();
+ #if HOLD_NOTES
+             /* A press goes first: send_held() leaves it queued and returns
+              * without backing off, so retrying before it's read would spin. */
+@@ -1317,6 +1319,22 @@ static void voice_task(void *arg)
+                 muse_audio_loopback_test(muse_settings_volume());
+                 pre_reset();
+             }
++#if CONFIG_MUSE_HATCH
++            muse_input_event_t next;
++            if (stackchan_say_waiting() && xQueuePeek(s_queue, &next, 0) != pdTRUE && muse_hatch_say_begin()) {
++                /* stackchan.say: light the screen and speak it like a reply. */
++                bool delivered;
++                muse_state_set_asleep(false);
++                muse_wifi_power(MUSE_WIFI_FULL);
++                pending_down = hatch_reply(&delivered);
++                pre_reset();
++                if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
++                    muse_state_make_happy();
++                    go_idle("");
++                }
++                continue;
++            }
++#endif
+             /* The 20 ms read paces this loop. */
+             idle_capture();
+             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+@@ -1425,6 +1443,7 @@ static void voice_task(void *arg)
+ esp_err_t muse_voice_start(QueueHandle_t queue)
+ {
+     s_queue = queue;
++    stackchan_say_set_wake(muse_state_nudge);
+     s_pre = heap_caps_malloc(PRE_CAP_CHUNKS * sizeof(pre_chunk_t), MUSE_BIG_CAPS);
+     if (!s_pre || muse_audio_init(muse_settings_volume(), muse_settings_mic_gain()) != ESP_OK) {
+         muse_state_set_mode(MUSE_MODE_ERROR);
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index 3cfb523..3360295 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -92,6 +92,7 @@
+ #include "boards/p4_csi_camera.h"
+ #define camera_capture_base64 p4_csi_camera_capture
+ #endif
++#include "stackchan_tts.h"
+ #if CONFIG_MUSE_ENABLED
+ #include "muse_glue.h"
+ #include "muse_input.h"
+@@ -2076,6 +2077,31 @@ static cJSON *on_ws_command(
+         return async;
+     }
+ #endif
++#if CONFIG_MUSE_HATCH
++    if (strcmp(command, "stackchan.say") == 0) {
++        cJSON *text = cJSON_GetObjectItem(params, "text");
++        if (!cJSON_IsString(text) || !text->valuestring || !text->valuestring[0]) {
++            return command_error("missing_param", "text is required");
++        }
++        if (!stackchan_tts_enabled()) {
++            return command_error("tts_not_configured", "no Google TTS key on the device (>tts_key=)");
++        }
++        size_t bytes = 0;
++        bool truncated = false;
++        if (!stackchan_say_post(text->valuestring, &bytes, &truncated)) {
++            return command_error("out_of_memory", "failed to queue the text");
++        }
++        /* Replies now: the speech follows on the voice task. */
++        cJSON *result = cJSON_CreateObject();
++        cJSON *payload = cJSON_CreateObject();
++        cJSON_AddBoolToObject(result, "ok", true);
++        cJSON_AddBoolToObject(payload, "queued", true);
++        cJSON_AddNumberToObject(payload, "bytes", (double)bytes);
++        cJSON_AddBoolToObject(payload, "truncated", truncated);
++        cJSON_AddItemToObject(result, "payload", payload);
++        return result;
++    }
++#endif
+ #if CONFIG_HOMEHUB_VOICE
+     if (strcmp(command, "voice.configure") == 0) {
+         return voice_configure_command(params);
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index 421f916..6ac4ab7 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1563,6 +1563,17 @@ static char *build_register_json(void) {
+     }
+ #endif
+ 
++#if CONFIG_MUSE_HATCH
++    cJSON *say_required = cJSON_CreateObject();
++    cJSON_AddItemToObject(say_required, "text",
++                          string_param("What to say, up to 1023 bytes (longer is cut)."));
++    add_command(commands, "stackchan.say",
++                "Speak text aloud on Stack-chan now (Google TTS), with the "
++                "speaking face. Not part of the chat. Replies once queued, "
++                "before speaking; a newer say replaces one not yet started.",
++                say_required, nullptr);
++#endif
++
+ #if CONFIG_HOMEHUB_VOICE
+     cJSON *volume_optional = cJSON_CreateObject();
+     cJSON *volume_param = cJSON_CreateObject();
