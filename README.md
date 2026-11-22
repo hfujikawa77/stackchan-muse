@@ -8,11 +8,11 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 - `avatar/muse_pixel.c` ... ｽﾀｯｸﾁｬﾝ風アバターのレンダラ（SDK の `components/muse/avatar/` へコピー。上流側では gitignore 対象）
 - `components/stackchan_hw/` ... サーボ・LED・頭タッチのドライバ（ESP-IDF コンポーネント）
 - `components/stackchan_tts/` ... Google Cloud TTS による読み上げ
-- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS、`0003` サーボ・LED のコマンド）
+- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS、`0003` サーボ・LED のコマンド、`0004` `stackchan.say`）。上流 cc852b4（2026-11-09）で適用確認
 - `sdkconfig.stackchan` ... CoreS3 向けの追加 sdkconfig
 - `tools/apply.sh` / `tools/build.sh` ... 反映とビルド（WSL）
 - `tools/flash.ps1` ... ビルド → 書き込みを1コマンドで行う（Windows）
-- `tools/make-tts-patch.py` / `tools/make-hw-patch.py` ... `patches/0002` / `0003` の再生成
+- `tools/make-tts-patch.py` / `tools/make-hw-patch.py` / `tools/make-say-patch.py` ... `patches/0002` / `0003` / `0004` の再生成
 - `build-out/` ... ビルド成果物（gitignore 対象）
 
 ## 前提
@@ -109,6 +109,15 @@ Muse からは `stackchan.led`（`r`,`g`,`b`）と `stackchan.servo`（`x`,`y`,`
 
 ## 元のファームに戻す
 HermesLLM に戻すときは、PlatformIO で `stackchan-arduino/examples/HermesLLM` を書き込む。
+
+## Muse コマンド `stackchan.say`
+Muse（エージェント）から任意のテキストをスタックチャンに喋らせる（`components/stackchan_tts/stackchan_say.c` + `patches/0004`）。
+- 引数: `text`（文字列・必須）。1023 バイトを超える分は UTF-8 の文字境界で切り捨て
+- 受け付けた時点で即座に `{"ok":true,"payload":{"queued":true,"bytes":N,"truncated":false}}` を返す（再生完了は待たない）
+- 本体がアイドルになったら Google TTS で合成して再生。返事と同じ経路なので、アバターの speaking 表示・字幕・発話中の LED と首振り（`stackchan_hw`）もそのまま連動する
+- チャットには投稿しない（履歴に残らない）。再生前に新しい say が来たら置き換え。会話中などで 60 秒以内に始められなければ破棄
+- 再生中に PWR を押すと中断して通常の録音に移る
+- TTS キー未設定なら `tts_not_configured` エラーを返す
 
 ## ライセンス
 自作部分は Apache-2.0（`LICENSE`）。`patches/` は上流 muse-gadget-sdk（Apache-2.0）への差分で、上流の著作権表示はそのまま残る。m5stack-avatar (MIT) を参考/流用する場合は、ヘッダーとライセンス表記を残す。
