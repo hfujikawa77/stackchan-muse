@@ -756,6 +756,11 @@ static void hw_task(void *arg) {
                     if (!happy) {   // remember where the head was, to go back to
                         happy = true;
                         stackchan_servo_position(&pet_x, &pet_y);
+                        // Within the soft limits: a head that sagged below them with the
+                        // power off (Y 105) would clamp every nod target to 90, so the nod
+                        // never moved; and going back should not mean going back to a sag.
+                        pet_x = clampi(pet_x, STACKCHAN_SERVO_X_MIN, STACKCHAN_SERVO_X_MAX);
+                        pet_y = clampi(pet_y, STACKCHAN_SERVO_Y_MIN, STACKCHAN_SERVO_Y_MAX);
                     }
                     wait_restore = false;   // still being stroked
                     if (!fake_stroke) pet_restore_at = 0;   // a hand is on the head: no going back yet
