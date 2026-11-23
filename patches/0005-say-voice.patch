@@ -1,0 +1,46 @@
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1567,11 +1567,17 @@
+     cJSON *say_required = cJSON_CreateObject();
+     cJSON_AddItemToObject(say_required, "text",
+                           string_param("What to say, up to 1023 bytes (longer is cut)."));
++    cJSON *say_optional = cJSON_CreateObject();
++    cJSON_AddItemToObject(say_optional, "voice",
++                          string_param("Google Cloud TTS voice name to speak in, e.g. "
++                                       "en-US-Neural2-C; its language comes from the name. "
++                                       "Without it, each sentence is read in the voice for its "
++                                       "language: Japanese, English or Mongolian."));
+     add_command(commands, "stackchan.say",
+                 "Speak text aloud on Stack-chan now (Google TTS), with the "
+                 "speaking face. Not part of the chat. Replies once queued, "
+                 "before speaking; a newer say replaces one not yet started.",
+-                say_required, nullptr);
++                say_required, say_optional);
+ #endif
+ 
+ #if CONFIG_HOMEHUB_VOICE
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -2090,7 +2090,11 @@
+         }
+         size_t bytes = 0;
+         bool truncated = false;
+-        if (!stackchan_say_post(text->valuestring, &bytes, &truncated)) {
++        cJSON *voice = cJSON_GetObjectItem(params, "voice");
++        const char *v = cJSON_IsString(voice) && voice->valuestring && voice->valuestring[0]
++                            ? voice->valuestring : NULL;
++        if (v && strlen(v) >= 40) return command_error("bad_param", "voice name too long");
++        if (!stackchan_say_post_voice(text->valuestring, v, &bytes, &truncated)) {
+             return command_error("out_of_memory", "failed to queue the text");
+         }
+         /* Replies now: the speech follows on the voice task. */
+@@ -2100,6 +2104,7 @@
+         cJSON_AddBoolToObject(payload, "queued", true);
+         cJSON_AddNumberToObject(payload, "bytes", (double)bytes);
+         cJSON_AddBoolToObject(payload, "truncated", truncated);
++        if (v) cJSON_AddStringToObject(payload, "voice", v);
+         cJSON_AddItemToObject(result, "payload", payload);
+         return result;
+     }

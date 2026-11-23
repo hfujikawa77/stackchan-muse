@@ -22,7 +22,8 @@ bool stackchan_tts_begin(const char *text);
 size_t stackchan_tts_read(unsigned char *dst, size_t max, bool *ended, bool *failed);
 
 // Serial commands (line without the leading '>'): "tts_key=...", "tts_voice=...",
-// "tts_key=" (clear). Returns true if the line was one of them.
+// "tts_voice_en=...", "tts_voice_mn=..." ("" restores the default), "tts_key=" (clear),
+// "say=TEXT", "sayv=VOICE,TEXT". Returns true if the line was one of them.
 bool stackchan_tts_console_command(const char *line);
 
 // ---- stackchan.say (stackchan_say.c) ----
@@ -34,6 +35,14 @@ bool stackchan_tts_console_command(const char *line);
 // Queues text to be spoken outside any chat turn, replacing one not yet played,
 // and returns at once. *bytes gets the length kept, *truncated whether it was cut.
 bool stackchan_say_post(const char *text, size_t *bytes, bool *truncated);
+// The same with a Google TTS voice for it (e.g. "en-US-Neural2-C"), or NULL for the voice of
+// each sentence's language (#13). False also for a voice name 40 bytes or longer.
+bool stackchan_say_post_voice(const char *text, const char *voice, size_t *bytes, bool *truncated);
+
+// The voice for the next stackchan_tts_begin() only (it expires after 15 s if none comes).
+// Without one, each sentence is read in the voice for its language: Japanese tts_voice,
+// English tts_voice_en, Mongolian tts_voice_mn (by its letters; mixed: the most letters).
+void stackchan_tts_set_next_voice(const char *voice);
 
 // For the Muse voice task while idle: whether a say is queued, and taking it
 // (malloc'd, the caller frees; NULL if none, or dropped as stale).

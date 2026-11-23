@@ -19,6 +19,7 @@ static const char *TAG = "sc.say";
 
 static SemaphoreHandle_t s_lock;
 static char *volatile s_text;  // pending text, or NULL
+static char s_voice[40];       // its voice, or "" (by language)
 static int64_t s_posted_us;
 static void (*s_wake)(void);
 
@@ -41,7 +42,12 @@ void stackchan_say_set_wake(void (*wake)(void)) {
 }
 
 bool stackchan_say_post(const char *text, size_t *bytes, bool *truncated) {
+    return stackchan_say_post_voice(text, NULL, bytes, truncated);
+}
+
+bool stackchan_say_post_voice(const char *text, const char *voice, size_t *bytes, bool *truncated) {
     if (!text || !text[0] || !ensure_lock()) return false;
+    if (voice && strlen(voice) >= sizeof s_voice) return false;
     size_t n = strlen(text);
     size_t keep = whole_utf8(text, n, STACKCHAN_SAY_MAX);
     char *copy = heap_caps_malloc(keep + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -52,11 +58,13 @@ bool stackchan_say_post(const char *text, size_t *bytes, bool *truncated) {
     if (s_text) ESP_LOGI(TAG, "replacing a say not yet played");
     free(s_text);
     s_text = copy;
+    strcpy(s_voice, voice ? voice : "");
     s_posted_us = esp_timer_get_time();
     xSemaphoreGive(s_lock);
     if (bytes) *bytes = keep;
     if (truncated) *truncated = keep < n;
-    ESP_LOGI(TAG, "queued %u bytes%s", (unsigned)keep, keep < n ? " (truncated)" : "");
+    ESP_LOGI(TAG, "queued %u bytes%s%s%s", (unsigned)keep, keep < n ? " (truncated)" : "",
+             voice ? ", voice " : "", voice ? voice : "");
     if (s_wake) s_wake();
     return true;
 }
@@ -71,6 +79,8 @@ char *stackchan_say_take(void) {
     char *t = s_text;
     s_text = NULL;
     bool stale = t && esp_timer_get_time() - s_posted_us > SAY_STALE_US;
+    // The voice goes to the TTS request that speaks this text (the next one started).
+    if (t && !stale && s_voice[0]) stackchan_tts_set_next_voice(s_voice);
     xSemaphoreGive(s_lock);
     if (stale) {
         ESP_LOGW(TAG, "dropping a say queued %d s ago", (int)(SAY_STALE_US / 1000000));
