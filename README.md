@@ -112,6 +112,12 @@ python -c "import serial,getpass,time; ss=input('ssid: '); pw=getpass.getpass('p
 ## 日本語の表示
 `sdkconfig.stackchan` で `CONFIG_MUSE_CJK_FONT=y`（GNU Unifont、フラッシュ約 1.2 MB）。無効だと返事の日本語が □ になる。`tools/build.sh` は、`sdkconfig.stackchan` に書いた項目をビルドディレクトリの古い sdkconfig から消してから作るので、項目を足せばそのまま反映される。
 
+## モンゴル語（キリル文字）
+- 画面: `components/stackchan_fonts/stackchan_font_cyr_16.c`（GNU Unifont 8×16、U+0400〜U+052F、約 5 KB）を字幕フォントの CJK の後ろにつなぎ、キリル文字を含む文は CJK と同じ経路で描く（パッチ 0003 の `muse_ui.c` / `muse_text.c`）
+- 音声: Google Cloud TTS にモンゴル語の声はない（`>tts_voices=mn-MN` は 0 件）ので、キリル文字の文はロシア語の声 `ru-RU-Wavenet-A` で読む（`>tts_voice_mn=` で変更。#13）
+- 文ごとの言語判定: かな・漢字 = 日本語（`tts_voice`）、ラテン文字 = 英語（`tts_voice_en`、既定 `en-US-Neural2-C`）、キリル文字 = モンゴル語（`tts_voice_mn`）。`stackchan.say` の `voice` で 1 回だけ声を指定できる（パッチ 0005）
+- シリアル: `>say=TEXT`、`>sayv=VOICE,TEXT`、`>tts_voices=LANG`（Google の声の一覧）
+
 ## トラブルシュート
 ### Wi-Fi に繋がらない
 シリアルログ（115200 bps）の `link.wifi` を見る。ハートビートが `wifi=down` のままなら未接続。

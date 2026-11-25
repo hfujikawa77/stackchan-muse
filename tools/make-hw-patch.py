@@ -8,7 +8,8 @@ import sys, pathlib, subprocess, tempfile, shutil
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 FILES = ["main/CMakeLists.txt", "main/noise_control.cpp", "main/app.c", "main/sdk_token_console.c",
-         "components/muse/CMakeLists.txt", "components/muse/muse_audio.c", "components/muse/muse_state.c"]
+         "components/muse/CMakeLists.txt", "components/muse/muse_audio.c", "components/muse/muse_state.c",
+         "components/muse/muse_ui.c", "components/muse/muse_text.c"]
 
 
 def sub1(s, old, new):
@@ -211,7 +212,33 @@ def console(s):
 
 def muse_cmake(s):
     return sub1(s, "list(APPEND muse_priv_requires camera stackchan_tts)",
-                "list(APPEND muse_priv_requires camera stackchan_tts stackchan_hw)")
+                "list(APPEND muse_priv_requires camera stackchan_tts stackchan_hw stackchan_fonts)")
+
+
+def muse_text(s):
+    # A text with Cyrillic is drawn and paged like one with CJK, in the caption font, whose
+    # Unifont fallback has it (Montserrat and unscii-8 don't). Line breaking is per character
+    # elsewhere (muse_text_cjk()) and still treats Cyrillic as words.
+    return sub1(s, "        size_t len;\n        decode((const unsigned char *)s, &len);\n        s += len;\n    }\n    return false;\n}\n",
+                "        size_t len;\n        int32_t cp = decode((const unsigned char *)s, &len);\n"
+                "        if (cp >= 0x400 && cp <= 0x52F) {   /* stackchan-muse: Cyrillic (Mongolian, #13) */\n"
+                "            return true;\n"
+                "        }\n"
+                "        s += len;\n    }\n    return false;\n}\n")
+
+
+def muse_ui(s):
+    # Captions: after the CJK font, Unifont's 8x16 Cyrillic (Mongolian, #13), not boxes.
+    s = sub1(s, "/* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that\n",
+             "LV_FONT_DECLARE(stackchan_font_cyr_16)   /* stackchan-muse: Cyrillic captions */\n\n"
+             "/* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that\n")
+    return sub1(s, "        font = lv_font_unscii_16;\n        font.fallback = &CJK_FONT;\n",
+                "        font = lv_font_unscii_16;\n"
+                "        /* stackchan-muse: a copy of the CJK font, falling back to Cyrillic. */\n"
+                "        static lv_font_t cjk_cyr;\n"
+                "        cjk_cyr = CJK_FONT;\n"
+                "        cjk_cyr.fallback = &stackchan_font_cyr_16;\n"
+                "        font.fallback = &cjk_cyr;\n")
 
 
 def muse_audio(s):
@@ -240,7 +267,8 @@ def muse_state(s):
 
 EDITS = {"main/CMakeLists.txt": cmake, "main/noise_control.cpp": noise, "main/app.c": app, "main/sdk_token_console.c": console,
          "components/muse/CMakeLists.txt": muse_cmake, "components/muse/muse_audio.c": muse_audio,
-         "components/muse/muse_state.c": muse_state}
+         "components/muse/muse_state.c": muse_state, "components/muse/muse_ui.c": muse_ui,
+         "components/muse/muse_text.c": muse_text}
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 try:

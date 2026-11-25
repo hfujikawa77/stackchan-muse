@@ -28,7 +28,9 @@ static const char *TAG = "sc.tts";
 #define DEFAULT_VOICE "ja-JP-Neural2-B"
 // Voices for text detected as English or Mongolian (#13); NVS tts_voice_en / tts_voice_mn.
 #define DEFAULT_VOICE_EN "en-US-Neural2-C"
-#define DEFAULT_VOICE_MN "mn-MN-Standard-A"   // not verified to exist; a 400 falls back to mn-MN alone
+// Google has no Mongolian voice (>tts_voices=mn-MN lists none), so Cyrillic is read by a
+// Russian one, the same alphabet (ө and ү come out imperfect): decided in #13.
+#define DEFAULT_VOICE_MN "ru-RU-Wavenet-A"
 #define NEXT_VOICE_US (15LL * 1000000)       // a voice set for the next request expires after this
 #define FIRST_CHUNK_BYTES 72    // short first piece so speech starts sooner
 #define CHUNK_BYTES 260

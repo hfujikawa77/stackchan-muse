@@ -1,0 +1,4 @@
+# The caption font is an LVGL font: the same LVGL the muse component uses.
+dependencies:
+  lvgl/lvgl:
+    version: "9.5.0"
