@@ -1,8 +1,8 @@
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
-index 5c89865..d9e6796 100644
+index 895c9c4..825961f 100644
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -200,7 +200,7 @@ set(muse_priv_requires
+@@ -278,7 +278,7 @@ set(muse_priv_requires
      # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
      # before Kconfig values exist, so these can't depend on it; only the code does.
      fatfs esp_driver_sdspi sdmmc)
@@ -12,10 +12,10 @@ index 5c89865..d9e6796 100644
  if(IDF_TARGET STREQUAL "esp32p4")
      list(APPEND muse_priv_requires esp_driver_jpeg)
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 256b5b2..670b524 100644
+index 8e56c92..6824420 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
-@@ -74,6 +74,7 @@ extern "C" {
+@@ -79,6 +79,7 @@ extern "C" {
  #include "muse_account_api.h"
  #include "muse_link.h"
  #include "muse_settings.h"
@@ -23,7 +23,7 @@ index 256b5b2..670b524 100644
  #include "muse_wifi.h"
  }
  #include "muse_chat_priv.h"
-@@ -269,6 +270,8 @@ struct turn_t {
+@@ -300,6 +301,8 @@ struct turn_t {
      uint8_t *mp3;            /* MP3_BUF */
      size_t mp3_len;
      bool mp3_ended;
@@ -32,7 +32,7 @@ index 256b5b2..670b524 100644
      mp3dec_t dec;
      resampler_t down;
      int kbps;
-@@ -1063,6 +1066,7 @@ static void turn_begin(uint32_t gen)
+@@ -1208,6 +1211,7 @@ static void turn_begin(uint32_t gen)
      if (!turn_start(gen, false)) {
          return;
      }
@@ -40,7 +40,7 @@ index 256b5b2..670b524 100644
      if (VOICE_NOTE) {
          if (!open_note()) {
              disconnect("chat open failed");
-@@ -1608,6 +1612,24 @@ static void start_tts(void)
+@@ -2238,6 +2242,24 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -65,7 +65,7 @@ index 256b5b2..670b524 100644
          m.pcm_start = s_turn.pcm_out;
          /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
           * was kept at reading pace, not stretched over the whole reply's time
-@@ -1673,6 +1695,37 @@ static void decode(void)
+@@ -2304,6 +2326,37 @@ static void decode(void)
      if (s_turn.tts_msg < 0) {
          return;
      }
@@ -104,35 +104,35 @@ index 256b5b2..670b524 100644
          pace_silently();
          return;
 diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
-index 7818684..3a9d7d2 100644
+index dbce4ba..cbe1c58 100644
 --- a/esp32/main/CMakeLists.txt
 +++ b/esp32/main/CMakeLists.txt
-@@ -49,6 +49,7 @@ set(GADGET_SRCS
- )
+@@ -56,6 +56,7 @@ if(CONFIG_GADGET_SDK_TOKEN_CONSOLE)
+ endif()
  
  set(GADGET_REQUIRES
 +    stackchan_tts
      nvs_flash
+     network_proxy
      esp_wifi
-     esp_event
 diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
-index 1602c22..c079f51 100644
+index 0a958c0..dea5282 100644
 --- a/esp32/main/sdk_token_console.c
 +++ b/esp32/main/sdk_token_console.c
-@@ -29,6 +29,7 @@
- #include "soc/soc_caps.h"
+@@ -30,6 +30,7 @@
  
+ #include "esp_wifi.h"
  #include "identity.h"
 +#include "stackchan_tts.h"
- 
- // The chip's own USB port, where it has one and the log goes to it.
- #define USJ_CONSOLE (SOC_USB_SERIAL_JTAG_SUPPORTED && \
-@@ -44,6 +45,7 @@ static const char *TAG = "link.sdk_token";
- #define COMMAND_LINE_MAX 96
+ #include "wifi_known.h"
+ #include "wifi_mgr.h"
+ #include "network_proxy_tls.h"
+@@ -112,6 +113,7 @@ done:
+ }
  
  bool sdk_token_console_command(const char *line) {
 +    if (stackchan_tts_console_command(line)) return true;
+     if (proxy_command(line)) return true;
      if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
      const char *token = line + strlen(COMMAND);
-     if (!identity_sdk_token_valid(token)) {
 

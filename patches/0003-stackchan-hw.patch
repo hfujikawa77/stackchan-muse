@@ -1,18 +1,18 @@
 diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
 --- a/esp32/main/CMakeLists.txt
 +++ b/esp32/main/CMakeLists.txt
-@@ -50,6 +50,7 @@
+@@ -57,6 +57,7 @@
  
  set(GADGET_REQUIRES
      stackchan_tts
 +    stackchan_hw
      nvs_flash
+     network_proxy
      esp_wifi
-     esp_event
 diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
 --- a/esp32/main/noise_control.cpp
 +++ b/esp32/main/noise_control.cpp
-@@ -1354,6 +1354,13 @@
+@@ -1440,6 +1440,13 @@
  }
  #endif
  
@@ -26,10 +26,10 @@ diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
  static void add_command(cJSON *commands, const char *name,
                          const char *description,
                          cJSON *required, cJSON *optional) {
-@@ -1410,6 +1417,31 @@
-                 "voltage, and whether it is charging or on USB power; each is "
-                 "null when the device has no battery or can't measure it",
-                 nullptr, nullptr);
+@@ -1524,6 +1531,31 @@
+                 " Also returns structured capabilities: board, devices and WASM API discovery."
+ #endif
+                 , nullptr, nullptr);
 +    {
 +        cJSON *led = cJSON_CreateObject();
 +        cJSON_AddItemToObject(led, "r", int_param("Red, 0 to 255."));
@@ -57,19 +57,19 @@ diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
 +    }
  #if CONFIG_HOMEHUB_TUNNEL
      add_command(commands, "device.discover",
-                 "Scan local network for devices (ARP, mDNS, SSDP, SNMP, NetBIOS)",
+                 "Scan local network for devices (ARP, mDNS, SSDP, WSD, SNMP, NetBIOS, vendor)",
 diff --git a/esp32/main/app.c b/esp32/main/app.c
 --- a/esp32/main/app.c
 +++ b/esp32/main/app.c
-@@ -61,6 +61,7 @@
+@@ -68,6 +68,7 @@
  #include "image_fetch.h"
  #include "noise_tunnel.h"
  #include "led_status.h"
 +#include "stackchan_hw.h"
  #include "button.h"
  #include "tunnel_netif.h"
- #include "net_discovery.h"
-@@ -113,7 +114,9 @@
+ #include "tunnel_relay.h"
+@@ -127,7 +128,9 @@
  #define WIFI_JOIN_TRIES         3       // saved networks tried per join
  #define WIFI_JOIN_TRY_MIN_MS    8000    // each one's share of the timeout, at least
  #define WIFI_JOIN_SCAN_MAX      40      // as many networks as a scan reports
@@ -77,12 +77,12 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
 +#define WIFI_QUICK_MIN_RSSI     (-65)   // near enough to join without a full scan
 +                                        // stackchan-muse: was -75, which took a weak last-joined
 +                                        // network over a strong one; a full scan picks the strongest
+ #define WIFI_REJOIN_MS          12000   // straight to the cached access point, then the probe
  #define MAX_SCAN_RESULTS        25
  #define TOKEN_BUF_BYTES         2048
- #define VM_AUTH_REFRESH_RETRY_INTERVAL_US (60LL * 1000000LL)
-@@ -1941,6 +1944,71 @@
- 
- #endif  // CONFIG_HOMEHUB_BLE_COMMANDS
+@@ -2142,6 +2145,71 @@
+ }
+ #endif
  
 +/* stackchan.led / stackchan.servo: quick, so they run right here on the session task. */
 +static int json_int(cJSON *params, const char *key, int fallback, bool *present) {
@@ -152,7 +152,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
  static cJSON *on_ws_command(
      const char *command, cJSON *params, const char *request_id,
      noise_ctrl_session_generation_t session_generation) {
-@@ -1949,6 +2017,9 @@
+@@ -2150,6 +2218,9 @@
          return ble_commands_handle(command, params, request_id, session_generation);
      }
  #endif
@@ -162,7 +162,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
      if (strcmp(command, "device.list_vms") == 0) {
          return list_vms_command();
      }
-@@ -2858,6 +2929,7 @@
+@@ -3183,6 +3254,7 @@
  #if CONFIG_HOMEHUB_VOICE
      voice_init();
  #endif
@@ -173,23 +173,20 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
 diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
 --- a/esp32/main/sdk_token_console.c
 +++ b/esp32/main/sdk_token_console.c
-@@ -30,6 +30,9 @@
- 
+@@ -31,6 +31,9 @@
+ #include "esp_wifi.h"
  #include "identity.h"
  #include "stackchan_tts.h"
 +#include "stackchan_hw.h"
 +#include "wifi_known.h"
 +#include <stdlib.h>
+ #include "wifi_known.h"
+ #include "wifi_mgr.h"
+ #include "network_proxy_tls.h"
+@@ -112,8 +115,63 @@
+     return true;
+ }
  
- // The chip's own USB port, where it has one and the log goes to it.
- #define USJ_CONSOLE (SOC_USB_SERIAL_JTAG_SUPPORTED && \
-@@ -42,10 +45,65 @@
- 
- #define COMMAND "sdk_token="
- // A command line: '>', the command and a token, with room to spare.
--#define COMMAND_LINE_MAX 96
-+#define COMMAND_LINE_MAX 128
-+
 +/* stackchan-muse: Wi-Fi from a PC over the serial console, for when the phone can't.
 + *   >wifi=SSID,PASSWORD   save it first among the saved networks and restart to join it
 + *   >wifi_forget=SSID     forget a saved network
@@ -242,18 +239,18 @@ diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
 +    esp_restart();
 +    return true;
 +}
- 
++
  bool sdk_token_console_command(const char *line) {
      if (stackchan_tts_console_command(line)) return true;
 +    if (stackchan_hw_console_command(line)) return true;
 +    if (wifi_console_command(line)) return true;
+     if (proxy_command(line)) return true;
      if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
      const char *token = line + strlen(COMMAND);
-     if (!identity_sdk_token_valid(token)) {
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -206,7 +206,7 @@
+@@ -278,7 +278,7 @@
      # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
      # before Kconfig values exist, so these can't depend on it; only the code does.
      fatfs esp_driver_sdspi sdmmc)
@@ -265,17 +262,17 @@ diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeL
 diff --git a/esp32/components/muse/muse_audio.c b/esp32/components/muse/muse_audio.c
 --- a/esp32/components/muse/muse_audio.c
 +++ b/esp32/components/muse/muse_audio.c
-@@ -32,6 +32,7 @@
- #include "muse_board.h"
+@@ -33,6 +33,7 @@
  #include "muse_mem.h"
+ #include "muse_mirror_audio.h"
  #include "muse_settings.h"
 +#include "stackchan_hw.h"
+ #include "muse_motion.h"
  
  static const char *TAG = "muse_audio";
- 
-@@ -430,6 +431,7 @@
-     bool mute = !muse_settings_speaker_on();
+@@ -434,6 +435,7 @@
      while (frames) {
+         bool mute = mirror_only || !muse_settings_speaker_on() || muse_motion_quiet();
          size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
 +        stackchan_hw_audio_level(muse_audio_level(mono, n));   /* speech animation */
          for (size_t i = 0; i < n; i++) {
@@ -292,7 +289,7 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
  
  #define HAPPY_SECS 1.6f
  
-@@ -60,6 +61,7 @@
+@@ -63,6 +64,7 @@
  
  void muse_state_init(void)
  {
@@ -300,7 +297,7 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
      static StaticSemaphore_t lock;
      s_format_lock = xSemaphoreCreateMutexStatic(&lock);
      static StaticEventGroup_t wake;
-@@ -81,6 +83,7 @@
+@@ -84,6 +86,7 @@
      }
      s_mode_since_us = esp_timer_get_time();
      s_mode = mode;
@@ -311,32 +308,31 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
 diff --git a/esp32/components/muse/muse_ui.c b/esp32/components/muse/muse_ui.c
 --- a/esp32/components/muse/muse_ui.c
 +++ b/esp32/components/muse/muse_ui.c
-@@ -565,6 +565,8 @@
- LV_FONT_DECLARE(muse_font_latin_16)
+@@ -694,6 +694,8 @@
+ }
  #endif
  
 +LV_FONT_DECLARE(stackchan_font_cyr_16)   /* stackchan-muse: Cyrillic captions */
 +
  /* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that
-  * falls back to Unifont's 16x16 CJK, the same cell, for what unscii lacks. */
- static const lv_font_t *caption_font(void)
-@@ -573,7 +575,11 @@
-     static lv_font_t font;
-     if (!font.get_glyph_dsc) {
-         font = lv_font_unscii_16;
--        font.fallback = &CJK_FONT;
-+        /* stackchan-muse: a copy of the CJK font, falling back to Cyrillic. */
-+        static lv_font_t cjk_cyr;
-+        cjk_cyr = CJK_FONT;
-+        cjk_cyr.fallback = &stackchan_font_cyr_16;
-+        font.fallback = &cjk_cyr;
- #if CONFIG_MUSE_LATIN_FONT
-         static lv_font_t cjk;   /* and a copy of that for accented letters among CJK */
-         cjk = CJK_FONT;
+  * falls back to Unifont's 16x16 CJK, the same cell, for what unscii lacks.
+  * With CONFIG_MUSE_EMOJI, the last fallback is the emoji, 16 px images two
+@@ -720,6 +722,11 @@
+         font.fallback = &cjk;
+ #endif
+ #endif
++        /* stackchan-muse: Cyrillic (Mongolian, #13) first among the fallbacks. */
++        static lv_font_t cyr;
++        cyr = stackchan_font_cyr_16;
++        cyr.fallback = font.fallback;
++        font.fallback = &cyr;
+     }
+     return &font;
+ #else
 diff --git a/esp32/components/muse/muse_text.c b/esp32/components/muse/muse_text.c
 --- a/esp32/components/muse/muse_text.c
 +++ b/esp32/components/muse/muse_text.c
-@@ -244,7 +244,10 @@
+@@ -255,7 +255,10 @@
              return true;
          }
          size_t len;

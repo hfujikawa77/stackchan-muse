@@ -1,8 +1,8 @@
 diff --git a/esp32/components/muse/muse_chat.h b/esp32/components/muse/muse_chat.h
-index 48f0e25..7fd372f 100644
+index 2508584..e082c1c 100644
 --- a/esp32/components/muse/muse_chat.h
 +++ b/esp32/components/muse/muse_chat.h
-@@ -146,6 +146,14 @@ size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms
+@@ -196,6 +196,14 @@ size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms
  void muse_hatch_text_turn(char *text);
  void muse_hatch_text_cancel(void);
  
@@ -18,25 +18,28 @@ index 48f0e25..7fd372f 100644
   * Prints one "@chat" line per call (more if `text` is long): the type, then the
   * printf-style `fields` (JSON members, or NULL), then `text` escaped (or none).
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 670b524..9ee1e62 100644
+index 6824420..1752ec0 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
-@@ -156,12 +156,12 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
- 
+@@ -169,7 +169,7 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
  /* ---- Voice task <-> session task ---- */
  
--enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
-+enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_SAY };
- 
+ enum cmd_type_t : uint8_t {
+-    CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_INCOMING, CMD_OPTION,
++    CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_INCOMING, CMD_OPTION, CMD_SAY,
+ #if CONFIG_MUSE_PHOTO_NOTES
+     CMD_PHOTO,
+ #endif
+@@ -178,7 +178,7 @@ enum cmd_type_t : uint8_t {
  struct cmd_t {
      cmd_type_t type;
      uint32_t gen;
--    char *text;              /* CMD_TEXT: malloc'd, freed by the session task */
-+    char *text;              /* CMD_TEXT, CMD_SAY: malloc'd, freed by the session task */
- };
- 
- struct ev_t {
-@@ -264,6 +264,7 @@ struct turn_t {
+-    char *text;              /* CMD_TEXT: malloc'd, freed by the session task; CMD_PHOTO: its base64 */
++    char *text;              /* CMD_TEXT, CMD_SAY: malloc'd, freed by the session task; CMD_PHOTO: its base64 */
+ #if CONFIG_MUSE_PHOTO_NOTES
+     size_t len = 0;          /* CMD_PHOTO: the base64's length */
+ #endif
+@@ -295,6 +295,7 @@ struct turn_t {
      msg_t msgs[MAX_MSGS];
      int nmsgs;
      bool agent_busy;
@@ -44,16 +47,16 @@ index 670b524..9ee1e62 100644
      /* TTS */
      int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
      bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
-@@ -1503,7 +1504,7 @@ static void on_event(cJSON *line)
-         }
-         s_last_seq = v > s_last_seq ? v : s_last_seq;
+@@ -2111,7 +2112,7 @@ static void on_event(cJSON *line)
+         pending_event(event, payload, line);
+         return;
      }
 -    if (s_turn.phase != P_WAIT_REPLY) {
 +    if (s_turn.phase != P_WAIT_REPLY || s_turn.local) {
          return;
      }
-     const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, "event")) ?: "";
-@@ -1585,6 +1586,32 @@ static void on_chat_ack(stream_t *s)
+     bool was = s_turn.agent_busy;
+@@ -2215,6 +2216,32 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -86,7 +89,7 @@ index 670b524..9ee1e62 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -2125,6 +2152,12 @@ static void handle(const cmd_t &cmd)
+@@ -2784,6 +2811,12 @@ static void handle(const cmd_t &cmd)
          break;
      case CMD_WAKE:   /* only ends hatch_task's resting wait */
          break;
@@ -96,10 +99,10 @@ index 670b524..9ee1e62 100644
 +        }
 +        free(cmd.text);
 +        break;
-     }
- }
- 
-@@ -2394,6 +2427,27 @@ extern "C" void muse_hatch_text_cancel(void)
+ #if CONFIG_MUSE_PHOTO_NOTES
+     case CMD_PHOTO:
+         photo_attach(cmd.text, cmd.len, cmd.gen);
+@@ -3164,6 +3197,27 @@ extern "C" void muse_hatch_text_cancel(void)
      post(CMD_TEXT_CANCEL, 0);
  }
  
@@ -124,43 +127,43 @@ index 670b524..9ee1e62 100644
 +    return true;
 +}
 +
- extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
+ #if CONFIG_MUSE_PHOTO_NOTES
+ extern "C" uint32_t muse_chat_note_id(void)
  {
-     ev_t ev;
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 40d0143..22c5aff 100644
+index 74ca92b..4a4ea7c 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
-@@ -38,6 +38,7 @@
- #include "muse_settings.h"
+@@ -43,6 +43,7 @@
  #include "muse_state.h"
+ #include "muse_wakeword_glue.h"
  #include "muse_wifi.h"
 +#include "stackchan_tts.h"
- #if CONFIG_MUSE_REALTIME_VOICE
- #include "muse_voice_call.h"
- #include "muse_voice_call_core.h"
-@@ -1270,7 +1271,8 @@ static void voice_task(void *arg)
-             muse_input_event_t ev;
-             bool asleep = muse_state_asleep();
-             bool battery = muse_state_on_battery();
--            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;
-+            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback
+ #if CONFIG_MUSE_VOICE_SOFTWARE_AEC
+ #include "muse_aec.h"
+ #endif
+@@ -1761,7 +1762,8 @@ static void voice_task(void *arg)
+             /* The wake word opt-in keeps the codecs powered. Not
+              * muse_wakeword_listening(): it reads false while resting, and
+              * briefly after a reply until the wake task applies playback off. */
+-            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !muse_wakeword_enabled();
++            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !muse_wakeword_enabled()
 +                        && !stackchan_say_waiting();
  #if HOLD_NOTES
              /* A press goes first: send_held() leaves it queued and returns
               * without backing off, so retrying before it's read would spin. */
-@@ -1317,6 +1319,22 @@ static void voice_task(void *arg)
-                 muse_audio_loopback_test(muse_settings_volume());
-                 pre_reset();
+@@ -1842,6 +1844,22 @@ static void voice_task(void *arg)
+                 }
+                 continue;
              }
 +#if CONFIG_MUSE_HATCH
-+            muse_input_event_t next;
-+            if (stackchan_say_waiting() && xQueuePeek(s_queue, &next, 0) != pdTRUE && muse_hatch_say_begin()) {
++            muse_input_event_t say_next;
++            if (stackchan_say_waiting() && xQueuePeek(s_queue, &say_next, 0) != pdTRUE && muse_hatch_say_begin()) {
 +                /* stackchan.say: light the screen and speak it like a reply. */
 +                bool delivered;
 +                muse_state_set_asleep(false);
 +                muse_wifi_power(MUSE_WIFI_FULL);
-+                pending_down = hatch_reply(&delivered);
++                pending_down = hatch_reply(&delivered, "");
 +                pre_reset();
 +                if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
 +                    muse_state_make_happy();
@@ -172,7 +175,7 @@ index 40d0143..22c5aff 100644
              /* The 20 ms read paces this loop. */
              idle_capture();
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
-@@ -1425,6 +1443,7 @@ static void voice_task(void *arg)
+@@ -1980,6 +1998,7 @@ void muse_voice_seed_preroll(const int16_t *pcm, size_t frames)
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
@@ -181,18 +184,18 @@ index 40d0143..22c5aff 100644
      if (!s_pre || muse_audio_init(muse_settings_volume(), muse_settings_mic_gain()) != ESP_OK) {
          muse_state_set_mode(MUSE_MODE_ERROR);
 diff --git a/esp32/main/app.c b/esp32/main/app.c
-index 3cfb523..3360295 100644
+index ae607da..9cf3b04 100644
 --- a/esp32/main/app.c
 +++ b/esp32/main/app.c
-@@ -92,6 +92,7 @@
- #include "boards/p4_csi_camera.h"
- #define camera_capture_base64 p4_csi_camera_capture
+@@ -105,6 +105,7 @@
+ #include "boards/mosaico_camera.h"
+ #define camera_capture_base64 mosaico_camera_capture
  #endif
 +#include "stackchan_tts.h"
  #if CONFIG_MUSE_ENABLED
  #include "muse_glue.h"
  #include "muse_input.h"
-@@ -2076,6 +2077,31 @@ static cJSON *on_ws_command(
+@@ -2303,6 +2304,31 @@ static cJSON *on_ws_command(
          return async;
      }
  #endif
@@ -225,11 +228,11 @@ index 3cfb523..3360295 100644
      if (strcmp(command, "voice.configure") == 0) {
          return voice_configure_command(params);
 diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
-index 421f916..6ac4ab7 100644
+index 43063ec..b6cb642 100644
 --- a/esp32/main/noise_control.cpp
 +++ b/esp32/main/noise_control.cpp
-@@ -1563,6 +1563,17 @@ static char *build_register_json(void) {
-     }
+@@ -1729,6 +1729,17 @@ static char *build_register_json(void) {
+     muse_apps_advertise(commands);   // app.run and app.stop
  #endif
  
 +#if CONFIG_MUSE_HATCH

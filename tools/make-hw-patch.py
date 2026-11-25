@@ -202,8 +202,9 @@ static bool wifi_console_command(const char *line) {
 
 def console(s):
     s = sub1(s, '#include "stackchan_tts.h"\n', '#include "stackchan_tts.h"\n#include "stackchan_hw.h"\n#include "wifi_known.h"\n#include <stdlib.h>\n')
-    # an SSID (32) and a password (64) do not fit in 96
-    s = sub1(s, "#define COMMAND_LINE_MAX 96\n", "#define COMMAND_LINE_MAX 128\n")
+    # an SSID (32) and a password (64) do not fit in 96 (newer SDKs allow 1024 already)
+    if "#define COMMAND_LINE_MAX 96\n" in s:
+        s = sub1(s, "#define COMMAND_LINE_MAX 96\n", "#define COMMAND_LINE_MAX 128\n")
     s = sub1(s, "bool sdk_token_console_command(const char *line) {\n", WIFI_CONSOLE + "bool sdk_token_console_command(const char *line) {\n")
     return sub1(s, "    if (stackchan_tts_console_command(line)) return true;\n",
                 "    if (stackchan_tts_console_command(line)) return true;\n    if (stackchan_hw_console_command(line)) return true;\n"
@@ -232,23 +233,39 @@ def muse_ui(s):
     s = sub1(s, "/* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that\n",
              "LV_FONT_DECLARE(stackchan_font_cyr_16)   /* stackchan-muse: Cyrillic captions */\n\n"
              "/* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that\n")
-    return sub1(s, "        font = lv_font_unscii_16;\n        font.fallback = &CJK_FONT;\n",
-                "        font = lv_font_unscii_16;\n"
-                "        /* stackchan-muse: a copy of the CJK font, falling back to Cyrillic. */\n"
-                "        static lv_font_t cjk_cyr;\n"
-                "        cjk_cyr = CJK_FONT;\n"
-                "        cjk_cyr.fallback = &stackchan_font_cyr_16;\n"
-                "        font.fallback = &cjk_cyr;\n")
+    # Put a copy of the Cyrillic font right after unscii, before whatever chain the SDK built
+    # (CJK, accented letters, emoji): it has only U+0400-052F, so it takes nothing from them.
+    # Anchored on the end of caption_font()'s set-up, which differs between SDK versions.
+    old = ("#endif\n"
+           "    }\n"
+           "    return &font;\n"
+           "#else\n"
+           "    return &lv_font_unscii_16;\n"
+           "#endif\n"
+           "}\n")
+    new = ("#endif\n"
+           "        /* stackchan-muse: Cyrillic (Mongolian, #13) first among the fallbacks. */\n"
+           "        static lv_font_t cyr;\n"
+           "        cyr = stackchan_font_cyr_16;\n"
+           "        cyr.fallback = font.fallback;\n"
+           "        font.fallback = &cyr;\n"
+           "    }\n"
+           "    return &font;\n"
+           "#else\n"
+           "    return &lv_font_unscii_16;\n"
+           "#endif\n"
+           "}\n")
+    return sub1(s, old, new)
 
 
 def muse_audio(s):
     s = sub1(s, '#include "muse_settings.h"\n', '#include "muse_settings.h"\n#include "stackchan_hw.h"\n')
-    old = ("    while (frames) {\n"
-           "        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
+    # The speaker loop: the chunk size line, then the stereo copy (newer SDKs set `mute`
+    # between them, inside the loop).
+    old = ("        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
            "        for (size_t i = 0; i < n; i++) {\n"
            "            s_out_stereo[2 * i] = mute")
-    new = ("    while (frames) {\n"
-           "        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
+    new = ("        size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;\n"
            "        stackchan_hw_audio_level(muse_audio_level(mono, n));   /* speech animation */\n"
            "        for (size_t i = 0; i < n; i++) {\n"
            "            s_out_stereo[2 * i] = mute")

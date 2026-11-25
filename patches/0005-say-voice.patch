@@ -1,7 +1,7 @@
 diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
 --- a/esp32/main/noise_control.cpp
 +++ b/esp32/main/noise_control.cpp
-@@ -1567,11 +1567,17 @@
+@@ -1733,11 +1733,17 @@
      cJSON *say_required = cJSON_CreateObject();
      cJSON_AddItemToObject(say_required, "text",
                            string_param("What to say, up to 1023 bytes (longer is cut)."));
@@ -23,7 +23,7 @@ diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
 diff --git a/esp32/main/app.c b/esp32/main/app.c
 --- a/esp32/main/app.c
 +++ b/esp32/main/app.c
-@@ -2090,7 +2090,11 @@
+@@ -2315,7 +2315,11 @@
          }
          size_t bytes = 0;
          bool truncated = false;
@@ -36,7 +36,7 @@ diff --git a/esp32/main/app.c b/esp32/main/app.c
              return command_error("out_of_memory", "failed to queue the text");
          }
          /* Replies now: the speech follows on the voice task. */
-@@ -2100,6 +2104,7 @@
+@@ -2325,6 +2329,7 @@
          cJSON_AddBoolToObject(payload, "queued", true);
          cJSON_AddNumberToObject(payload, "bytes", (double)bytes);
          cJSON_AddBoolToObject(payload, "truncated", truncated);

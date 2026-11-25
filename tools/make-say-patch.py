@@ -35,19 +35,34 @@ void muse_hatch_text_cancel(void);
 bool muse_hatch_say_begin(void);
 """))
 
+def sub_any(s, pairs):
+    """The first (old, new) whose old is in s, exactly once: anchors that differ between SDK versions."""
+    for old, new in pairs:
+        if s.count(old) == 1:
+            return s.replace(old, new)
+    raise AssertionError("none of: " + " | ".join(o for o, _ in pairs))
+
 def chat(s):
-    s = sub1(s, "CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };",
-             "CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_SAY };")
+    s = sub_any(s, [
+        ("CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };", "CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_SAY };"),
+        # newer SDKs: more commands after CMD_WAKE
+        ("CMD_WAKE, CMD_INCOMING, CMD_OPTION,\n", "CMD_WAKE, CMD_INCOMING, CMD_OPTION, CMD_SAY,\n"),
+    ])
     s = sub1(s, "    bool agent_busy;\n",
              "    bool agent_busy;\n    bool local;              /* stackchan.say: nothing from the chat belongs to it */\n")
     # A say's turn takes no events: the agent that sent it is likely still busy,
     # and its status would hold the turn open after the speech.
-    s = sub1(s, "    if (s_turn.phase != P_WAIT_REPLY) {\n        return;\n    }\n"
-                "    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, \"event\")) ?: \"\";\n",
-             "    if (s_turn.phase != P_WAIT_REPLY || s_turn.local) {\n        return;\n    }\n"
-                "    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, \"event\")) ?: \"\";\n")
-    s = sub1(s, "    char *text;              /* CMD_TEXT: malloc'd, freed by the session task */",
-             "    char *text;              /* CMD_TEXT, CMD_SAY: malloc'd, freed by the session task */")
+    s = sub_any(s, [
+        ("    if (s_turn.phase != P_WAIT_REPLY) {\n        return;\n    }\n"
+         "    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, \"event\")) ?: \"\";\n",
+         "    if (s_turn.phase != P_WAIT_REPLY || s_turn.local) {\n        return;\n    }\n"
+         "    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, \"event\")) ?: \"\";\n"),
+        # newer SDKs read the event first (for options) and check the turn after
+        ("    if (s_turn.phase != P_WAIT_REPLY) {\n        return;\n    }\n    bool was = s_turn.agent_busy;\n",
+         "    if (s_turn.phase != P_WAIT_REPLY || s_turn.local) {\n        return;\n    }\n    bool was = s_turn.agent_busy;\n"),
+    ])
+    s = sub1(s, "    char *text;              /* CMD_TEXT: malloc'd",
+             "    char *text;              /* CMD_TEXT, CMD_SAY: malloc'd")
     # say_begin: after on_chat_ack, before the speech section
     s = sub1(s, "/* ---- Turn: speech ---- */\n",
 """static_assert(STACKCHAN_SAY_MAX < TEXT_MAX, "a say must fit one message's text");
@@ -120,20 +135,28 @@ edit("components/muse/muse_chat_session.cpp", chat)
 
 def voice(s):
     s = sub1(s, '#include "muse_wifi.h"\n', '#include "muse_wifi.h"\n#include "stackchan_tts.h"\n')
-    # Stay awake for a queued say.
-    s = sub1(s, "            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;\n",
-             "            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback\n"
-             "                        && !stackchan_say_waiting();\n")
+    # Stay awake for a queued say. (Newer SDKs also stay awake for the wake word.)
+    s = sub_any(s, [
+        ("            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;\n",
+         "            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback\n"
+         "                        && !stackchan_say_waiting();\n"),
+        ("            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !muse_wakeword_enabled();\n",
+         "            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !muse_wakeword_enabled()\n"
+         "                        && !stackchan_say_waiting();\n"),
+    ])
+    # hatch_reply() takes the caption to show until the reply in newer SDKs.
+    reply_call = "hatch_reply(&delivered, \"\")" if "static bool hatch_reply(bool *delivered, const char *opening)" in s \
+        else "hatch_reply(&delivered)"
     # Play it when idle, a press first.
     s = sub1(s, "            /* The 20 ms read paces this loop. */\n            idle_capture();\n",
 """#if CONFIG_MUSE_HATCH
-            muse_input_event_t next;
-            if (stackchan_say_waiting() && xQueuePeek(s_queue, &next, 0) != pdTRUE && muse_hatch_say_begin()) {
+            muse_input_event_t say_next;
+            if (stackchan_say_waiting() && xQueuePeek(s_queue, &say_next, 0) != pdTRUE && muse_hatch_say_begin()) {
                 /* stackchan.say: light the screen and speak it like a reply. */
                 bool delivered;
                 muse_state_set_asleep(false);
                 muse_wifi_power(MUSE_WIFI_FULL);
-                pending_down = hatch_reply(&delivered);
+                pending_down = REPLY_CALL;
                 pre_reset();
                 if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
                     muse_state_make_happy();
@@ -144,7 +167,7 @@ def voice(s):
 #endif
             /* The 20 ms read paces this loop. */
             idle_capture();
-""")
+""".replace("REPLY_CALL", reply_call))
     # A post wakes a resting loop.
     s = sub1(s, "esp_err_t muse_voice_start(QueueHandle_t queue)\n{\n    s_queue = queue;\n",
              "esp_err_t muse_voice_start(QueueHandle_t queue)\n{\n    s_queue = queue;\n"

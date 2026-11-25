@@ -8,7 +8,7 @@ Stack-chan (M5Stack CoreS3) を Muse ガジェットとして動かすための�
 - `avatar/muse_pixel.c` ... ｽﾀｯｸﾁｬﾝ風アバターのレンダラ（SDK の `components/muse/avatar/` へコピー。上流側では gitignore 対象）
 - `components/stackchan_hw/` ... サーボ・LED・頭タッチのドライバ（ESP-IDF コンポーネント）
 - `components/stackchan_tts/` ... Google Cloud TTS による読み上げ
-- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS、`0003` サーボ・LED のコマンド、`0004` `stackchan.say`）。上流 cc852b4（2026-11-09）で適用確認
+- `patches/` ... SDK への最小パッチ（`0001` 追加 sdkconfig、`0002` Google TTS、`0003` サーボ・LED のコマンド、`0004` `stackchan.say`、`0005` say の声指定）。上流 e8d2c98（2026-11-25）で適用確認。SDK を上げてパッチが当たらなくなったら `tools/make-*-patch.py` で作り直す。古いビルドの sdkconfig が新しい SDK と矛盾したら、`build-muse-m5stack-cores3-stackchan/sdkconfig` を消して作り直す
 - `sdkconfig.stackchan` ... CoreS3 向けの追加 sdkconfig
 - `tools/apply.sh` / `tools/build.sh` ... 反映とビルド（WSL）
 - `tools/flash.ps1` ... ビルド → 書き込みを1コマンドで行う（Windows）
