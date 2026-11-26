@@ -67,6 +67,9 @@ void stackchan_led_ui_effects(bool on);
 // can show it. Muse registers muse_state_make_happy() (hop, blush, hearts).
 void stackchan_hw_set_pet_callback(void (*cb)(void));
 
+// True while the robot is overjoyed (six pats: the head's full turn), for the screen's hearts.
+bool stackchan_hw_overjoyed(void);
+
 // Servos. Out-of-range angles are clamped to the soft limits, not rejected.
 esp_err_t stackchan_servo_move(int x_deg, int y_deg, uint32_t ms);
 esp_err_t stackchan_servo_center(uint32_t ms);

@@ -463,6 +463,7 @@ static void (*volatile s_pet_cb)(void);   // the face's happy reaction (muse_sta
 #define SPIN_SPEED          500     // as HermesLLM: 500 for 2 s is about one turn
 #define SPIN_MS             2000
 static volatile int s_fake_strokes;   // >stroke=N: as if stroked N times
+static volatile bool s_overjoyed;     // joy at the full-turn level, or turning: for the screen
 
 typedef enum { G_NONE, G_PRESS, G_RELEASE, G_SWIPE_FWD, G_SWIPE_BACK } gesture_t;
 
@@ -821,6 +822,7 @@ static void hw_task(void *arg) {
         }
         joy -= JOY_COOL_PER_S * ANIM_TICK_MS / 1000.0f;
         if (joy < 0) joy = 0;
+        s_overjoyed = happy && (spinning || joy >= JOY_SPIN);
         if (spinning && (int32_t)(now - spin_end) >= 0) {
             spin_x(false, 0);
             spinning = false;
@@ -1412,3 +1414,5 @@ void stackchan_hw_audio_level(float level) {
 void stackchan_hw_set_speech_anim(bool on) { s_anim_on = on; }
 
 void stackchan_hw_set_pet_callback(void (*cb)(void)) { s_pet_cb = cb; }
+
+bool stackchan_hw_overjoyed(void) { return s_overjoyed; }
