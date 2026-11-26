@@ -18,7 +18,7 @@ index 2508584..e082c1c 100644
   * Prints one "@chat" line per call (more if `text` is long): the type, then the
   * printf-style `fields` (JSON members, or NULL), then `text` escaped (or none).
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 6824420..1752ec0 100644
+index ba232ba..7391756 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -169,7 +169,7 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
@@ -89,7 +89,7 @@ index 6824420..1752ec0 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -2784,6 +2811,12 @@ static void handle(const cmd_t &cmd)
+@@ -2782,6 +2809,12 @@ static void handle(const cmd_t &cmd)
          break;
      case CMD_WAKE:   /* only ends hatch_task's resting wait */
          break;
@@ -102,7 +102,7 @@ index 6824420..1752ec0 100644
  #if CONFIG_MUSE_PHOTO_NOTES
      case CMD_PHOTO:
          photo_attach(cmd.text, cmd.len, cmd.gen);
-@@ -3164,6 +3197,27 @@ extern "C" void muse_hatch_text_cancel(void)
+@@ -3162,6 +3195,27 @@ extern "C" void muse_hatch_text_cancel(void)
      post(CMD_TEXT_CANCEL, 0);
  }
  

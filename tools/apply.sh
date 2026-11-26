@@ -24,6 +24,19 @@ done
 cp "$HERE/sdkconfig.stackchan" "$ESP/devices/sdkconfig.stackchan"
 echo "sdkconfig: copied"
 
+# 3D アバターの素材（上流 PR #513 の muse3d.bin。パッチ 0000 が埋め込む）。Jollybot の絵なので
+# このリポジトリには入れず、PR の固定コミットから取って SHA-256 を確かめる（#16）。
+MUSE3D_URL="https://raw.githubusercontent.com/gpulkitg/muse-gadget-sdk/f34ff31eaf87d32433ddec49fbe98306e1804df2/esp32/avatar/3d/muse3d.bin"
+MUSE3D_SHA256="36427c5dde3ba11ad080318ccc010d4a635c8e0e9afb987bc2dddd1f53918cda"
+MUSE3D="$ESP/avatar/3d/muse3d.bin"
+if ! echo "$MUSE3D_SHA256  $MUSE3D" | sha256sum -c --status 2>/dev/null; then
+  mkdir -p "$(dirname "$MUSE3D")"
+  curl -fsSL -o "$MUSE3D.tmp" "$MUSE3D_URL"
+  echo "$MUSE3D_SHA256  $MUSE3D.tmp" | sha256sum -c --status || { rm -f "$MUSE3D.tmp"; echo "muse3d.bin: SHA-256 mismatch" >&2; exit 3; }
+  mv "$MUSE3D.tmp" "$MUSE3D"
+  echo "muse3d.bin: fetched"
+fi
+
 # パッチ（適用済みならスキップ）
 # パッチは重なる（0003 は 0002 と同じファイルを触る）ので、適用済みのものを後ろから外してから、前から入れ直す。
 shopt -s nullglob

@@ -36,8 +36,12 @@ def chat(s):
              "static void turn_begin(uint32_t gen)\n{\n    if (!turn_start(gen, false)) {\n        return;\n    }\n    stackchan_tts_prewarm();   /* TLS to Google while the user is still talking */\n")
     s = sub1(s, "    bool mp3_ended;\n    mp3dec_t dec;",
              "    bool mp3_ended;\n    bool sc_tts;             /* MP3 is arriving from stackchan_tts */\n    int64_t sc_t0;           /* when that request started */\n    mp3dec_t dec;")
-    # start_tts: try Google TTS first
-    s = sub1(s, "        m.pcm_start = s_turn.pcm_out;\n        /* Paced to the text kept:",
+    # start_tts: try Google TTS first. The comment after pcm_start differs between SDK
+    # versions (upstream PR #513 rewrites it), so the anchor is whichever is there.
+    anchor = next(a for a in ("        m.pcm_start = s_turn.pcm_out;\n        /* Paced to the text kept:",
+                              "        m.pcm_start = s_turn.pcm_out;\n        /* The reply and its captions advance together")
+                  if s.count(a) == 1)
+    s = sub1(s, anchor,
 """        s_turn.sc_tts = false;
         if (s_turn.texts && s_turn.texts[i * TEXT_MAX] && s_turn.mp3 && stackchan_tts_begin(s_turn.texts + i * TEXT_MAX)) {
             m.pcm_start = s_turn.pcm_out;
@@ -56,8 +60,7 @@ def chat(s):
             show_reply_start(m);
             return;
         }
-        m.pcm_start = s_turn.pcm_out;
-        /* Paced to the text kept:""")
+""" + anchor)
     # decode: pull MP3 from stackchan_tts
     s = sub1(s, "    if (s_turn.silent) {\n        pace_silently();\n        return;\n    }\n    /*\n     * minimp3",
 """    if (s_turn.sc_tts && !s_turn.silent) {

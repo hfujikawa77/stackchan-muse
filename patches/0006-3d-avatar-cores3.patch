@@ -1,0 +1,141 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -116,10 +116,14 @@
+     if(custom_avatar)
+         message(STATUS "Custom avatar: components/muse/avatar/muse_pixel.c")
+         list(APPEND srcs "avatar/muse_pixel.c")
+-    elseif(CONFIG_MUSE_BOARD_WAVESHARE_S3_175C)
++    elseif(CONFIG_MUSE_BOARD_WAVESHARE_S3_175C OR CONFIG_MUSE_BOARD_M5STACK_CORES3)
++        # stackchan-muse: the 3D-style avatar on the CoreS3 too (#16)
+         set(muse_cached_avatar ON)
+         list(APPEND srcs "../../avatar/muse_3d.c" "muse_expression.c")
+         list(APPEND embed "../../avatar/3d/muse3d.bin")
++        if(CONFIG_MUSE_BOARD_M5STACK_CORES3)
++            list(APPEND srcs "boards/muse_lcd_bands_none.c")   # no LCD bands on this board
++        endif()
+     else()
+         list(APPEND srcs "../../avatar/muse_pixel.c")
+     endif()
+diff --git a/esp32/components/muse/muse_ui.c b/esp32/components/muse/muse_ui.c
+--- a/esp32/components/muse/muse_ui.c
++++ b/esp32/components/muse/muse_ui.c
+@@ -54,7 +54,13 @@
+ #include "muse_pixel.h"
+ #if MUSE_CACHED_AVATAR
+ #include "muse_3d.h"
++#if CONFIG_MUSE_BOARD_M5STACK_CORES3   /* stackchan-muse: no LCD bands (muse_lcd_bands_none.c) */
++uint32_t muse_lcd_bands_submitted(void);
++uint32_t muse_lcd_bands_completed(void);
++uint32_t muse_lcd_bands_failures(void);
++#else
+ #include "boards/muse_lcd_bands.h"
++#endif
+ #define LAYOUT_GRID 160   /* retain this board's existing artwork margins and caption placement */
+ #else
+ #define LAYOUT_GRID MUSE_PX_W
+@@ -2780,6 +2786,64 @@
+ /* A legacy custom C renderer can keep its original four-function API. */
+ __attribute__((weak)) void muse_pixel_set_background(uint32_t rgb) {(void)rgb;}
+ 
++
++#if MUSE_CACHED_AVATAR
++/* stackchan-muse (#16): hearts over the 3D avatar while it is happy (a pat), as the built-in
++ * character draws them. The poses have none of their own. Three small A8 images rise from
++ * above the head and fade; the 3D renderer is not involved. */
++static const uint8_t s_heart_px[9 * 8] = {
++    0,255,255,0,0,0,255,255,0,
++    255,255,255,255,0,255,255,255,255,
++    255,255,255,255,255,255,255,255,255,
++    255,255,255,255,255,255,255,255,255,
++    0,255,255,255,255,255,255,255,0,
++    0,0,255,255,255,255,255,0,0,
++    0,0,0,255,255,255,0,0,0,
++    0,0,0,0,255,0,0,0,0,
++};
++static const lv_image_dsc_t s_heart_dsc = {
++    .header = {.magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_A8, .w = 9, .h = 8, .stride = 9},
++    .data_size = sizeof(s_heart_px),
++    .data = s_heart_px,
++};
++#define HEARTS 3
++static lv_obj_t *s_hearts[HEARTS];
++
++static void hearts_tick(float happy, bool visible)
++{
++    if (!s_canvas) return;
++    if (!s_hearts[0]) {
++        for (int i = 0; i < HEARTS; i++) {
++            s_hearts[i] = lv_image_create(lv_obj_get_parent(s_canvas));
++            lv_image_set_src(s_hearts[i], &s_heart_dsc);
++            lv_image_set_scale(s_hearts[i], 512);   /* 18 x 16 */
++            lv_obj_set_style_image_recolor(s_hearts[i], lv_color_hex(0xff4f8b), 0);
++            lv_obj_set_style_image_recolor_opa(s_hearts[i], LV_OPA_COVER, 0);
++            lv_obj_add_flag(s_hearts[i], LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_IGNORE_LAYOUT);
++            lv_obj_remove_flag(s_hearts[i], LV_OBJ_FLAG_CLICKABLE);
++        }
++    }
++    bool show = visible && happy > 0;
++    int32_t size = lv_obj_get_width(s_canvas);
++    int32_t x0 = lv_obj_get_x(s_canvas), y0 = lv_obj_get_y(s_canvas);
++    float t = (float)esp_timer_get_time() / 1e6f;
++    for (int i = 0; i < HEARTS; i++) {
++        if (!show) {
++            lv_obj_add_flag(s_hearts[i], LV_OBJ_FLAG_HIDDEN);
++            continue;
++        }
++        float phase = t * 0.7f + i / (float)HEARTS;   /* each rises over about 1.4 s */
++        phase -= (int)phase;
++        int32_t x = x0 + size * 60 / 100 + i * size / 9 + (int32_t)(sinf(phase * 6.28f + i) * size / 40);
++        int32_t y = y0 + size * 22 / 100 - (int32_t)(phase * size * 0.25f);
++        lv_obj_set_pos(s_hearts[i], x, y);
++        lv_obj_set_style_image_opa(s_hearts[i], (lv_opa_t)(255 * (1.0f - phase) * (happy < 1 ? happy : 1)), 0);
++        lv_obj_remove_flag(s_hearts[i], LV_OBJ_FLAG_HIDDEN);
++        lv_obj_move_foreground(s_hearts[i]);
++    }
++}
++#endif
++
+ static void frame_tick(lv_timer_t *timer)
+ {
+ #if MUSE_CACHED_AVATAR
+@@ -2948,6 +3012,7 @@
+ #if MUSE_CACHED_AVATAR
+         s_was_visible = !lv_obj_has_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
+         if (s_was_visible) update_cached_avatar(mode, &pose, !was_visible);
++        hearts_tick(pose.happy, s_was_visible);   /* stackchan-muse */
+ #else
+         muse_pixel_render(&pose);
+         invalidate_muse();
+diff --git a/esp32/components/muse/boards/board_m5stack_cores3.c b/esp32/components/muse/boards/board_m5stack_cores3.c
+--- a/esp32/components/muse/boards/board_m5stack_cores3.c
++++ b/esp32/components/muse/boards/board_m5stack_cores3.c
+@@ -170,6 +170,9 @@
+     .width = BSP_LCD_H_RES,
+     .height = BSP_LCD_V_RES,
+     .round = false,
++#if MUSE_CACHED_AVATAR
++    .avatar_px = 240,   /* stackchan-muse: the 3D avatar larger than the default 160 (#16) */
++#endif
+     .touch = true,
+     .diagonal_in = 2.0f,
+     .talk_button = "power",
+diff --git a/esp32/components/muse/boards/muse_lcd_bands_none.c b/esp32/components/muse/boards/muse_lcd_bands_none.c
+new file mode 100644
+--- /dev/null
++++ b/esp32/components/muse/boards/muse_lcd_bands_none.c
+@@ -0,0 +1,14 @@
++/* stackchan-muse: the transfer counters of muse_lcd_bands.c for a board that draws
++ * through esp_lvgl_port instead (the M5Stack CoreS3). The cached 3D avatar (upstream PR
++ * #513) waits for its patch to reach the panel before showing the next expression: it
++ * notes submitted() when it invalidates, again at LVGL's RENDER_READY, then waits for
++ * completed() to reach that. Here each call to submitted() is a new ticket and completed()
++ * is the latest one, so a refresh counts as presented when it has been rendered; the
++ * port's flush follows straight after. Nothing fails. */
++#include <stdint.h>
++
++static uint32_t s_ticket;
++
++uint32_t muse_lcd_bands_submitted(void) { return __atomic_add_fetch(&s_ticket, 1, __ATOMIC_RELAXED); }
++uint32_t muse_lcd_bands_completed(void) { return __atomic_load_n(&s_ticket, __ATOMIC_RELAXED); }
++uint32_t muse_lcd_bands_failures(void) { return 0; }

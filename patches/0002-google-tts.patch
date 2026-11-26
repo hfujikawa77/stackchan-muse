@@ -1,8 +1,8 @@
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
-index 895c9c4..825961f 100644
+index fa78944..43c80de 100644
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -278,7 +278,7 @@ set(muse_priv_requires
+@@ -282,7 +282,7 @@ set(muse_priv_requires
      # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
      # before Kconfig values exist, so these can't depend on it; only the code does.
      fatfs esp_driver_sdspi sdmmc)
@@ -12,7 +12,7 @@ index 895c9c4..825961f 100644
  if(IDF_TARGET STREQUAL "esp32p4")
      list(APPEND muse_priv_requires esp_driver_jpeg)
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index 8e56c92..6824420 100644
+index 0e2a409..ba232ba 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -79,6 +79,7 @@ extern "C" {
@@ -63,9 +63,9 @@ index 8e56c92..6824420 100644
 +            return;
 +        }
          m.pcm_start = s_turn.pcm_out;
-         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
-          * was kept at reading pace, not stretched over the whole reply's time
-@@ -2304,6 +2326,37 @@ static void decode(void)
+         /* The reply and its captions advance together across all retained text. */
+         size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+@@ -2302,6 +2324,37 @@ static void decode(void)
      if (s_turn.tts_msg < 0) {
          return;
      }

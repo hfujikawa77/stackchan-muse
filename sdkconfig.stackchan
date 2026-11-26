@@ -1,11 +1,14 @@
 # CoreS3 (Stack-chan) 向けの追加設定。devices/sdkconfig.muse と muse-m5stack-cores3 の後に重ねる。
 # apply.sh が devices/sdkconfig.stackchan として SDK に置き、patches/0001 で board.sh が読み込む。
 
-# ライブ音声通話（タップで開始/終了、長押しは従来どおり音声メモ）。Muse が声で返事する。
-CONFIG_MUSE_REALTIME_VOICE=y
-# 通話開始時に Muse が挨拶する（動作確認用。うるさければ n）
-CONFIG_MUSE_REALTIME_VOICE_GREETING=y
+# ライブ音声通話は使わない。Muse 側が 404 で通話を受けず（MUSE DIDN'T TAKE THE CALL）、
+# 3D アバター（#16）の素材でアプリ領域 4 MB が埋まるため外す。
+CONFIG_MUSE_REALTIME_VOICE=n
 
 # 返事の文字の日本語（かな・漢字）を表示する。無効だと □ になる。GNU Unifont 16x16、フラッシュ約 1.2 MB。
 # （Noto Sans SC の版は簡体字 GB2312 の範囲だけで、日本語の漢字が一部欠けるので使わない）
 CONFIG_MUSE_CJK_FONT=y
+
+# My Muse のアバター同期は使わない。Gadget API が静止画を JPEG で返し、SDK は WebP しか読めない
+# ため表示できない（#15）。3D アバター（#16）とは PSRAM とフラッシュを取り合う。
+CONFIG_MUSE_AVATAR_SYNC=n

@@ -250,7 +250,7 @@ diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -278,7 +278,7 @@
+@@ -282,7 +282,7 @@
      # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
      # before Kconfig values exist, so these can't depend on it; only the code does.
      fatfs esp_driver_sdspi sdmmc)
@@ -289,7 +289,7 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
  
  #define HAPPY_SECS 1.6f
  
-@@ -63,6 +64,7 @@
+@@ -64,6 +65,7 @@
  
  void muse_state_init(void)
  {
@@ -297,7 +297,7 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
      static StaticSemaphore_t lock;
      s_format_lock = xSemaphoreCreateMutexStatic(&lock);
      static StaticEventGroup_t wake;
-@@ -84,6 +86,7 @@
+@@ -85,6 +87,7 @@
      }
      s_mode_since_us = esp_timer_get_time();
      s_mode = mode;
@@ -308,7 +308,7 @@ diff --git a/esp32/components/muse/muse_state.c b/esp32/components/muse/muse_sta
 diff --git a/esp32/components/muse/muse_ui.c b/esp32/components/muse/muse_ui.c
 --- a/esp32/components/muse/muse_ui.c
 +++ b/esp32/components/muse/muse_ui.c
-@@ -694,6 +694,8 @@
+@@ -850,6 +850,8 @@
  }
  #endif
  
@@ -317,7 +317,7 @@ diff --git a/esp32/components/muse/muse_ui.c b/esp32/components/muse/muse_ui.c
  /* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that
   * falls back to Unifont's 16x16 CJK, the same cell, for what unscii lacks.
   * With CONFIG_MUSE_EMOJI, the last fallback is the emoji, 16 px images two
-@@ -720,6 +722,11 @@
+@@ -876,6 +878,11 @@
          font.fallback = &cjk;
  #endif
  #endif
